@@ -23,7 +23,7 @@ const PREFETCH_MIN = Number(process.env.PREFETCH_MINUTES) || 40;  // how long a 
 
 globalThis.TMDB_API_KEY = TMDB_API_KEY;   // the plugins read the key from here, like inside Nuvio
 
-const BUNDLED_DIR = path.join(__dirname, 'providers');
+   const BUNDLED_DIR = __dirname;
 const CACHE_DIR = process.env.DATA_DIR || path.join(__dirname, '.provider-cache');   // inside the project so require('cheerio') resolves
 
 const log = (...a) => console.log(new Date().toISOString(), ...a);
