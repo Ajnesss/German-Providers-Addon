@@ -20,10 +20,15 @@ const UPDATE_URL = process.env.UPDATE_URL || 'https://invalidpandaa.github.io/nu
 const UPDATE_HOURS = Number(process.env.UPDATE_HOURS) || 12;
 const PREFETCH = process.env.PREFETCH !== '0';                    // look up the next episode in advance
 const PREFETCH_MIN = Number(process.env.PREFETCH_MINUTES) || 40;  // how long a prefetched result is kept
+// Home relay: a copy of this addon running on the FireTV (home internet) registers its tunnel address here, and
+// /stream requests are passed to it, because many sites (VOE, AniWorld …) block data-centre servers like Render.
+const RELAY_TOKEN = (process.env.RELAY_TOKEN || '').trim();
+let relay = null;   // { url, time }
 
 globalThis.TMDB_API_KEY = TMDB_API_KEY;   // the plugins read the key from here, like inside Nuvio
 
-   const BUNDLED_DIR = __dirname;
+// the plugin files normally live in ./providers; a GitHub web upload can flatten them into the main folder
+const BUNDLED_DIR = fs.existsSync(path.join(__dirname, 'providers', 'manifest.json')) ? path.join(__dirname, 'providers') : __dirname;
 const CACHE_DIR = process.env.DATA_DIR || path.join(__dirname, '.provider-cache');   // inside the project so require('cheerio') resolves
 
 const log = (...a) => console.log(new Date().toISOString(), ...a);
@@ -177,6 +182,8 @@ function getStreams(type, id, prefetched) {
 }
 
 // ---------- HTTP server ----------
+const relayAlive = () => !!relay && Date.now() - relay.time < 12 * 60000;
+
 function addonManifest() {
     return {
         id: 'community.german-providers.addon',
@@ -206,9 +213,21 @@ const server = http.createServer(async (req, res) => {
     const url = decodeURIComponent((req.url || '/').split('?')[0]);
     if (req.method === 'OPTIONS') return send(res, 204, {});
     if (url === '/' || url === '/health') {
-        return send(res, 200, { ok: true, addon: `${req.headers['x-forwarded-proto'] || 'http'}://${req.headers.host}/manifest.json`, plugins: pluginVersion, providers: providers.map(p => p.id), tmdbKey: !!TMDB_API_KEY });
+        return send(res, 200, { ok: true, homeRelay: relayAlive() ? 'online' : 'offline', addon: `${req.headers['x-forwarded-proto'] || 'http'}://${req.headers.host}/manifest.json`, plugins: pluginVersion, providers: providers.map(p => p.id), tmdbKey: !!TMDB_API_KEY });
     }
     if (url === '/manifest.json') return send(res, 200, addonManifest(), 3600);
+
+    // ---- home relay ----
+    const q = new URL(req.url || '/', 'http://x').searchParams;
+    if (url === '/relay/register' || url === '/relay/config') {
+        if (!RELAY_TOKEN || q.get('token') !== RELAY_TOKEN) return send(res, 403, { error: 'wrong token' });
+        if (url === '/relay/config') return send(res, 200, { tmdbKey: TMDB_API_KEY });
+        const target = q.get('url') || '';
+        if (!/^https:\/\/[a-z0-9-]+\.trycloudflare\.com$/.test(target)) return send(res, 400, { error: 'bad url' });
+        if (!relay || relay.url !== target) log(`home relay registered: ${target}`);
+        relay = { url: target, time: Date.now() };
+        return send(res, 200, { ok: true });
+    }
 
     // diagnostics: /check/series/tt0944947:1:1  -> what every provider returns from this server (no cache)
     const c = url.match(/^\/check\/(movie|series)\/(.+?)(\.json)?$/);
@@ -234,6 +253,18 @@ const server = http.createServer(async (req, res) => {
     if (!TMDB_API_KEY) return send(res, 200, { streams: [], error: 'TMDB_API_KEY is not set' });
     const t0 = Date.now();
     log(`stream ${m[1]} ${m[2]}`);
+    if (relayAlive()) {
+        try {
+            const r = await fetch(relay.url + url, { signal: AbortSignal.timeout(TIMEOUT_MS + 10000) });
+            const body = await r.json();
+            if (!r.ok || !Array.isArray(body.streams)) throw new Error(`HTTP ${r.status}`);
+            log(`  -> ${body.streams.length} streams from home relay in ${Date.now() - t0} ms`);
+            return send(res, 200, body);
+        } catch (e) {
+            log(`  home relay failed (${e.message}), searching from here instead`);
+            relay = null;
+        }
+    }
     try {
         const streams = await getStreams(m[1], m[2]);
         // autoplay asks for the next episode only seconds before it starts; have the answer ready by then
@@ -257,4 +288,4 @@ if (require.main === module) {
     if (AUTO_UPDATE) { update(); setInterval(update, UPDATE_HOURS * 3600000).unref(); }
 }
 
-module.exports = { server, loadFrom, toAddonStream, getStreams, _cache: cache, _providers: () => providers };
+module.exports = { _setRelay: r => { relay = r; }, server, loadFrom, toAddonStream, getStreams, _cache: cache, _providers: () => providers };
