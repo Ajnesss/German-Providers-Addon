@@ -130,7 +130,8 @@ function toAddonStream(s, provider) {
         url,
         behaviorHints: {
             // same group on every episode -> Nuvio/Stremio pick this addon again for the next episode
-            bingeGroup: `german-providers-${key}`,
+            // per provider: start on Huhu and the next episode stays on Huhu (only falls back if Huhu has nothing)
+            bingeGroup: `german-providers-${provider.id}-${key}`,
             notWebReady: !!headers || undefined,
             proxyHeaders: headers ? { request: headers } : undefined,
         },
@@ -156,7 +157,7 @@ async function lookup(type, id) {
     const started = Date.now();
     const runs = active.map((p, order) => runProvider(p, tmdbId, pType, season, episode)
         .then(list => {
-            (list || []).forEach((st, i) => results.push(Object.assign(toAddonStream(st, p), { order, i })));
+            (list || []).forEach((st, i) => results.push(Object.assign(toAddonStream(st, p), { order, i, pref: prefIndex(p.id) })));
             log(`  ${p.id}: ${(list || []).length} streams in ${Date.now() - started} ms`);
         })
         .catch(err => log(`  ${p.id}: error ${err.message}`)));
@@ -175,7 +176,11 @@ async function lookup(type, id) {
     return sortStreams(snapshot);
 }
 
-const sortStreams = list => list.slice().sort((a, b) => a.rank - b.rank || a.order - b.order || a.i - b.i).map(x => x.stream);
+// provider order in the list (within each language group): dedicated streaming sites first, loose matchers last
+const PREFERRED = (process.env.PROVIDER_ORDER || 'serienstream,aniworld,huhuto,moflix,filmpalast,megakino,kinoking,hdfilme,filmo,kellerkino,flixitv,filmfrei24,ard,arte,dmax,tele5,tlc,southpark,netzkino,plutotv')
+    .split(',').map(x => x.trim());
+const prefIndex = id => { const i = PREFERRED.indexOf(id); return i < 0 ? PREFERRED.length : i; };
+const sortStreams = list => list.slice().sort((a, b) => a.rank - b.rank || a.pref - b.pref || a.order - b.order || a.i - b.i).map(x => x.stream);
 
 function getStreams(type, id, prefetched) {
     const key = `${type}:${id}`;
