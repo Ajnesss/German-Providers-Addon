@@ -69,7 +69,7 @@ function isBlocked(status, type, buf) {
     if (BLOCK_STATUS.has(status)) return true;
     if (status >= 400 || !/html/i.test(type || '') || buf.byteLength > 60000) return false;
     const head = Buffer.from(buf).toString('utf8', 0, Math.min(buf.byteLength, 6000));
-    return CHALLENGE.test(head) || (buf.byteLength < 8000 && CAPTCHA.test(head));
+    return CHALLENGE.test(head);
 }
 const snippet = (type, buf) => buf.byteLength && buf.byteLength < 4000 && /html|text|json/i.test(type || '')
     ? Buffer.from(buf).toString('utf8').replace(/\s+/g, ' ').slice(0, 300) : undefined;
@@ -177,18 +177,31 @@ async function diag() {
     return { warp: warpUp ? 'on' : 'off', proxy: PROXY_URL ? 'set' : 'not set', results: rows };
 }
 
+// open a URL through one specific route without buffering (video pieces / files): status, headers, body stream
+async function open(route, url, headers, signal) {
+    const h = Object.assign({}, headers);
+    if (route === 'node') return nativeFetch(url, { headers: h, signal });
+    for (const k of Object.keys(h)) if (k.toLowerCase() === 'user-agent') delete h[k];
+    return client(route, true).fetch(url, { headers: h, signal });
+}
+
 // fetch only the start of a (possibly huge) file through a route: status + type, then hang up
 async function peek(route, url, headers) {
-    const h = Object.assign({}, headers);
-    for (const k of Object.keys(h)) if (k.toLowerCase() === 'user-agent') delete h[k];
     const ac = new AbortController();
     const timer = setTimeout(() => ac.abort(), 10000);
     try {
-        const r = await client(route, true).fetch(url, { headers: h, signal: ac.signal });
-        let first = 0;
-        if (r.body) { const rd = r.body.getReader(); const { value } = await rd.read(); first = value ? value.length : 0; rd.cancel().catch(() => {}); }
-        return { status: r.status, type: r.headers.get('content-type') || '', first };
+        const r = await open(route, url, headers, ac.signal);
+        let first = 0, head = '';
+        if (r.body) {
+            const rd = r.body.getReader();
+            const { value } = await rd.read();
+            if (value) { first = value.length; head = Buffer.from(value.subarray(0, 200)).toString('utf8'); }
+            rd.cancel().catch(() => {});
+        }
+        return { status: r.status, type: r.headers.get('content-type') || '', first, head, url: r.url || url };
     } finally { clearTimeout(timer); ac.abort(); }
 }
 
-module.exports = { peek, probe: (route, url, opts) => once(route, url, opts || {}, true), warpOn: () => warpUp, traceStore, smartFetch, nativeFetch, startWarpWatch, checkWarp, diag, status: () => ({ warp: warpUp, proxy: !!PROXY_URL, remembered: Object.fromEntries([...memory].map(([h, m]) => [h, m.route])), stats }) };
+const availableRoutes = () => ['node'].concat(warpUp ? ['warp'] : [], PROXY_URL ? ['proxy'] : []);
+
+module.exports = { open, availableRoutes, peek, probe: (route, url, opts) => once(route, url, opts || {}, true), warpOn: () => warpUp, traceStore, smartFetch, nativeFetch, startWarpWatch, checkWarp, diag, status: () => ({ warp: warpUp, proxy: !!PROXY_URL, remembered: Object.fromEntries([...memory].map(([h, m]) => [h, m.route])), stats }) };

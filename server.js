@@ -85,8 +85,15 @@ async function update() {
 
 // The plugins keep a little state per file (a deadline and a request counter), so one file must not run two
 // searches at the same time. Each provider gets a queue; the cache below stops the same title being searched twice.
+// a search that never finishes must not block the next ones: hard limit per search
+const PROVIDER_LIMIT_MS = Number(process.env.PROVIDER_LIMIT_MS) || 45000;
+function withLimit(promise, ms, what) {
+    let timer;
+    return Promise.race([promise, new Promise((_, reject) => { timer = setTimeout(() => reject(new Error(`${what} took longer than ${ms / 1000}s`)), ms); })])
+        .finally(() => clearTimeout(timer));
+}
 function runProvider(p, tmdbId, type, season, episode) {
-    const job = p.lock.then(() => p.mod.getStreams(tmdbId, type, season, episode));
+    const job = p.lock.then(() => withLimit(Promise.resolve().then(() => p.mod.getStreams(tmdbId, type, season, episode)), PROVIDER_LIMIT_MS, p.id));
     p.lock = job.catch(() => {});
     return job;
 }
@@ -278,7 +285,7 @@ async function runAudit(audit) {
             const addon = list.map(x => toAddonStream(x, p).stream);
             const seen = new Set(), pick = [];
             for (const a of addon) { const host = (a.title.split('\n')[1] || '').split(' · ')[0]; if (!seen.has(host)) { seen.add(host); pick.push(a); } if (pick.length >= 3) break; }
-            if (pick.length) out.play = await Promise.all(pick.map(async a => `${(a.title.split('\n')[1] || a.title).split(' · ')[0].slice(0, 24)}: ${await playCheck(a).catch(err => 'FAIL ' + err.message.slice(0, 50))}`));
+            if (pick.length) out.play = await Promise.all(pick.map(async a => `${(a.title.split('\n')[1] || a.title).split(' · ')[0].slice(0, 24)}: ${await withLimit(playCheck(a), 60000, 'play check').catch(err => 'FAIL ' + err.message.slice(0, 50))}`));
             row[p.id] = out;
         }));
         audit.progress = Object.keys(audit.titles).length + '/' + AUDIT_TITLES.length;

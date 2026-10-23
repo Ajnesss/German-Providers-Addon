@@ -25,25 +25,20 @@ function track(bytes) {
 }
 const overCap = () => usage.bytes >= CAP_BYTES;
 
-// Are the video pieces tied to the IP too, or only the playlist? Fetch one piece through WARP (a different IP):
-// if that works, the player can load pieces straight from the video host and only playlists go through here.
-const segDecision = new Map();   // host -> { direct, until }
-async function segmentsDirect(segUrl, headers) {
-    let host;
-    try { host = new URL(segUrl).host; } catch (e) { return false; }
-    const known = segDecision.get(host);
-    if (known && known.until > Date.now()) return known.direct;
-    let direct = false;
-    if (overCap()) direct = true;
-    else if (net.warpOn()) {
-        try {
-            const r = await net.peek('warp', segUrl, Object.assign({}, headers, { Range: 'bytes=0-2047' }));
-            direct = (r.status === 200 || r.status === 206) && r.first > 0 && !/html|json|text\/plain/i.test(r.type);
-        } catch (e) { direct = false; }
-    }
-    segDecision.set(host, { direct, until: Date.now() + 6 * 3600000 });
-    return direct;
+// Which of the server's connections (plain / WARP / proxy) can load a URL? If more than one can, the link isn't tied
+// to an IP and the player may load it straight from the host. If only one can, it's locked to that connection, so
+// everything for this stream must go through the server on that same connection.
+const isMedia = r => (r.status === 200 || r.status === 206) && r.first > 0 && !/html/i.test(r.type) && !/^\s*</.test(r.head);
+async function reach(url, headers) {
+    const routes = net.availableRoutes();
+    const res = await Promise.all(routes.map(rt => net.peek(rt, url, Object.assign({}, headers, { Range: 'bytes=0-2047' }))
+        .then(r => ({ rt, r }), () => ({ rt, r: null }))));
+    const ok = res.filter(x => x.r && (isMedia(x.r) || /^#EXTM3U/.test((x.r.head || '').trim())));
+    const first = (ok[0] || res.find(x => x.r) || {}).r || null;
+    return { ok: ok.map(x => x.rt), all: routes, info: first };
 }
+const decisions = [];   // last decisions, for /net
+function note(d) { decisions.unshift(Object.assign({ at: new Date().toISOString().slice(11, 19) }, d)); decisions.length = Math.min(decisions.length, 25); }
 
 const b64 = s => Buffer.from(s).toString('base64url');
 const unb64 = s => Buffer.from(s, 'base64url').toString('utf8');
@@ -58,72 +53,48 @@ function wanted(stream, label, providerId) {
     return !DIRECT_PROVIDERS.includes(String(providerId || '').toLowerCase());
 }
 
-function proxyUrl(base, url, headers) {
-    const data = b64(JSON.stringify({ u: url, h: headers || {} }));
+function proxyUrl(base, url, headers, route) {
+    const data = b64(JSON.stringify(route ? { u: url, h: headers || {}, r: route } : { u: url, h: headers || {} }));
     const name = /\.m3u8(\?|$)/i.test(url) ? 'index.m3u8' : (url.split('?')[0].split('/').pop() || 'file').replace(/[^\w.-]/g, '').slice(-40) || 'file';
     return `${base}/p/${sign(data)}/${data}/${name}`;
 }
 
 const isPlaylist = (url, type, head) => /mpegurl/i.test(type || '') || /\.m3u8(\?|$)/i.test(url) || /^#EXTM3U/.test(head || '');
 
-async function rewritePlaylist(text, baseUrl, base, headers) {
+async function rewritePlaylist(text, baseUrl, base, headers, route) {
     const abs = u => new URL(u, baseUrl).toString();
     const lines = text.split(/\r?\n/);
     const media = /#EXTINF/.test(text);     // a playlist of video pieces (not a list of qualities)
-    let direct = false;
+    let direct = false, segRoute = route;
     if (media) {
         const first = lines.find(l => l.trim() && !l.trim().startsWith('#'));
-        direct = first ? await segmentsDirect(abs(first.trim()), headers) : false;
+        if (first) {
+            const seg = await reach(abs(first.trim()), headers);
+            direct = overCap() || (seg.ok.length > 1 && seg.ok.length === seg.all.length);
+            if (!direct && seg.ok.length) segRoute = seg.ok.includes(route) ? route : seg.ok[0];
+            note({ pieces: new URL(abs(first.trim())).host, works: seg.ok.join('+') || 'none', via: direct ? 'player direct' : 'server/' + segRoute });
+        }
     }
     usage.playlists++;
     return lines.map(line => {
         const t = line.trim();
         if (!t) return line;
-        if (t.startsWith('#')) return line.replace(/URI="([^"]+)"/g, (m, u) => `URI="${proxyUrl(base, abs(u), headers)}"`);
+        if (t.startsWith('#')) return line.replace(/URI="([^"]+)"/g, (m, u) => `URI="${proxyUrl(base, abs(u), headers, route)}"`);
         if (media && direct) { usage.segmentsDirect++; return abs(t); }
         if (media) usage.segmentsProxied++;
-        return proxyUrl(base, abs(t), headers);
+        return proxyUrl(base, abs(t), headers, media ? segRoute : route);
     }).join('\n');
 }
 
 const PASS = ['content-type', 'content-length', 'content-range', 'accept-ranges', 'last-modified', 'etag'];
+const UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36';
 
-// GET /p/<sig>/<data>/<name>
-async function handle(req, res, base) {
-    const m = (req.url || '').split('?')[0].match(/^\/p\/([\w-]+)\/([\w-]+)\//);
-    if (!m || sign(m[2]) !== m[1]) { res.writeHead(403); return res.end('bad link'); }
-    let job;
-    try { job = JSON.parse(unb64(m[2])); } catch (e) { res.writeHead(400); return res.end('bad link'); }
-    const headers = Object.assign({}, job.h);
-    if (req.headers.range) headers.Range = req.headers.range;
-    if (!Object.keys(headers).some(k => k.toLowerCase() === 'user-agent')) {
-        headers['User-Agent'] = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36';
-    }
-    let up;
-    try {
-        // plain streaming fetch first (no buffering of big files) ...
-        up = await net.nativeFetch(job.u, { headers, signal: AbortSignal.timeout(30000) });
-        // ... and the full fallback chain (Chrome-like / WARP) if the host refuses it
-        if (up.status === 403 || up.status === 429 || up.status === 503) up = await net.smartFetch(job.u, { headers });
-    } catch (e) {
-        res.writeHead(502); return res.end('upstream failed: ' + e.message);
-    }
-    const type = up.headers.get('content-type') || '';
-    if (isPlaylist(job.u, type)) {
-        const text = await up.text();
-        if (isPlaylist(job.u, type, text) && /^#EXTM3U/.test(text.trim())) {
-            const body = await rewritePlaylist(text, up.url || job.u, base, job.h);
-            res.writeHead(up.status, { 'Content-Type': 'application/vnd.apple.mpegurl', 'Access-Control-Allow-Origin': '*', 'Cache-Control': 'no-cache' });
-            return res.end(body);
-        }
-        res.writeHead(up.status, { 'Content-Type': type || 'text/plain' });
-        return res.end(text);
-    }
-    // a whole file or a video piece: send the player straight to the host when the link isn't tied to this server's IP
-    if (overCap() || (!isPlaylist(job.u, type) && await segmentsDirect(job.u, job.h))) {
-        try { up.body && up.body.cancel(); } catch (e) {}
-        res.writeHead(302, { Location: job.u, 'Access-Control-Allow-Origin': '*' }); return res.end();
-    }
+async function fetchText(route, url, headers) {
+    const r = await net.open(route, url, headers, AbortSignal.timeout(20000));
+    return { status: r.status, url: r.url || url, text: await r.text() };
+}
+
+async function pipe(req, res, up) {
     const out = { 'Access-Control-Allow-Origin': '*' };
     for (const k of PASS) { const v = up.headers.get(k); if (v) out[k] = v; }
     res.writeHead(up.status, out);
@@ -141,4 +112,49 @@ async function handle(req, res, base) {
     res.end();
 }
 
-module.exports = { usage: () => Object.assign({}, usage, { capGB: CAP_BYTES / 1024 ** 3, usedMB: Math.round(usage.bytes / 1048576), segmentHosts: Object.fromEntries([...segDecision].map(([h, d]) => [h, d.direct ? 'direct' : 'through server'])) }), wanted, proxyUrl, handle, rewritePlaylist, mode: MODE, hosts: HOSTS };
+// GET /p/<sig>/<data>/<name>
+async function handle(req, res, base) {
+    const m = (req.url || '').split('?')[0].match(/^\/p\/([\w-]+)\/([\w-]+)\//);
+    if (!m || sign(m[2]) !== m[1]) { res.writeHead(403); return res.end('bad link'); }
+    let job;
+    try { job = JSON.parse(unb64(m[2])); } catch (e) { res.writeHead(400); return res.end('bad link'); }
+    const headers = Object.assign({}, job.h);
+    if (!Object.keys(headers).some(k => k.toLowerCase() === 'user-agent')) headers['User-Agent'] = UA;
+    try {
+        let route = job.r;
+        let playlist = /\.m3u8(\?|$)/i.test(job.u);
+        if (!route) {
+            // first request of a stream: find out which connection(s) can load it
+            const r = await reach(job.u, headers);
+            if (!r.ok.length) {
+                note({ start: new URL(job.u).host, works: 'none', status: r.info ? r.info.status : 'error' });
+                res.writeHead(502); return res.end('the video host refused every connection');
+            }
+            route = r.ok.includes('node') ? 'node' : r.ok[0];
+            playlist = playlist || /mpegurl/i.test(r.info.type) || /^#EXTM3U/.test((r.info.head || '').trim());
+            if (!playlist) {
+                const free = overCap() || (r.ok.length > 1 && r.ok.length === r.all.length);
+                note({ file: new URL(job.u).host, works: r.ok.join('+'), via: free ? 'player direct' : 'server/' + route });
+                if (free) { res.writeHead(302, { Location: job.u, 'Access-Control-Allow-Origin': '*' }); return res.end(); }
+            }
+        }
+        if (playlist) {
+            const p = await fetchText(route, job.u, headers);
+            if (p.status < 400 && /^#EXTM3U/.test(p.text.trim())) {
+                const body = await rewritePlaylist(p.text, p.url, base, job.h, route);
+                res.writeHead(200, { 'Content-Type': 'application/vnd.apple.mpegurl', 'Access-Control-Allow-Origin': '*', 'Cache-Control': 'no-cache' });
+                return res.end(body);
+            }
+            res.writeHead(p.status >= 400 ? p.status : 502); return res.end('not a playlist');
+        }
+        if (overCap()) { res.writeHead(302, { Location: job.u }); return res.end(); }
+        const h = Object.assign({}, headers);
+        if (req.headers.range) h.Range = req.headers.range;
+        const up = await net.open(route, job.u, h, AbortSignal.timeout(60000));
+        return pipe(req, res, up);
+    } catch (e) {
+        if (!res.headersSent) { res.writeHead(502); res.end('upstream failed: ' + e.message); } else res.end();
+    }
+}
+
+module.exports = { usage: () => Object.assign({}, usage, { capGB: CAP_BYTES / 1024 ** 3, usedMB: Math.round(usage.bytes / 1048576), decisions }), wanted, proxyUrl, handle, rewritePlaylist, mode: MODE, hosts: HOSTS };
