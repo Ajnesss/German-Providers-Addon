@@ -193,9 +193,11 @@ async function lookup(type, id) {
         log(`  ${id} -> tmdb ${tmdbId} ${pType === 'tv' ? `S${season}E${episode}` : '(movie)'}`);
     } else {
         const [imdbOrTmdb, s, e] = id.split(':').filter(x => x !== 'tmdb');
-        season = type === 'series' ? Number(s) : null;
-        episode = type === 'series' ? Number(e) : null;
-        pType = type === 'movie' ? 'movie' : 'tv';
+        // 'anime' items (Xperience & co.) can be shows (with season:episode) or films (without)
+        const episodic = type === 'series' || (type === 'anime' && s != null && e != null);
+        season = episodic ? Number(s) : null;
+        episode = episodic ? Number(e) : null;
+        pType = episodic ? 'tv' : 'movie';
         tmdbId = /^tt\d+$/.test(imdbOrTmdb) ? await toTmdb(imdbOrTmdb, pType) : imdbOrTmdb;
     }
     if (!tmdbId) return [];
@@ -343,12 +345,12 @@ const relayAlive = () => !!relay && Date.now() - relay.time < 12 * 60000;
 function addonManifest() {
     return {
         id: 'community.german-providers.addon',
-        version: '1.2.0',
+        version: '1.3.0',
         name: 'German Providers',
         description: `Deutsche Quellen (s.to, AniWorld, ARD, Arte, FilmPalast …) als Addon. Plugins v${pluginVersion} von InvalidPandaa/nuvio-german-providers (GPL-3.0).`,
         logo: 'https://flagcdn.com/w160/de.png',
         resources: ['stream'],
-        types: ['movie', 'series'],
+        types: ['movie', 'series', 'anime'],
         idPrefixes: ['tt', 'tmdb:', 'kitsu:', 'mal:', 'anilist:', 'anidb:'],
         catalogs: [],
         behaviorHints: { configurable: false },
@@ -432,7 +434,7 @@ const server = http.createServer(async (req, res) => {
         } catch (err) { return send(res, 200, { error: err.message }); }
     }
 
-    const m = url.match(/^\/stream\/(movie|series)\/(.+)\.json$/);
+    const m = url.match(/^\/stream\/(movie|series|anime)\/(.+)\.json$/);
     if (!m) return send(res, 404, { error: 'not found' });
     if (!TMDB_API_KEY) return send(res, 200, { streams: [], error: 'TMDB_API_KEY is not set' });
     const t0 = Date.now();
@@ -452,10 +454,10 @@ const server = http.createServer(async (req, res) => {
     try {
         const streams = await getStreams(m[1], m[2]);
         // autoplay asks for the next episode only seconds before it starts; have the answer ready by then
-        const ep = m[1] === 'series' && m[2].match(/^(.*):(\d+):(\d+)$/);
+        const ep = m[1] !== 'movie' && m[2].match(/^(.*):(\d+):(\d+)$/);
         if (PREFETCH && ep && streams.length) {
             const next = `${ep[1]}:${ep[2]}:${Number(ep[3]) + 1}`;
-            setTimeout(() => getStreams('series', next, true).then(l => log(`prefetched ${next}: ${l.length} streams`), () => {}), 5000);
+            setTimeout(() => getStreams(m[1], next, true).then(l => log(`prefetched ${next}: ${l.length} streams`), () => {}), 5000);
         }
         log(`  -> ${streams.length} streams in ${Date.now() - t0} ms`);
         send(res, 200, { streams, cacheMaxAge: 300 });
