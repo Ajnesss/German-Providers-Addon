@@ -38,7 +38,7 @@ async function reach(url, headers) {
     return { ok: ok.map(x => x.rt), all: routes, info: first };
 }
 const decisions = [];   // last decisions, for /net
-function note(d) { decisions.unshift(Object.assign({ at: new Date().toISOString().slice(11, 19) }, d)); decisions.length = Math.min(decisions.length, 25); }
+function note(d) { decisions.unshift(Object.assign({ at: new Date().toISOString().slice(11, 19) }, d)); decisions.length = Math.min(decisions.length, 60); }
 
 const b64 = s => Buffer.from(s).toString('base64url');
 const unb64 = s => Buffer.from(s, 'base64url').toString('utf8');
@@ -134,15 +134,17 @@ async function handle(req, res, base) {
             const pref = job.s && net.rememberedRoute(job.s);
             const order = [pref, 'node'].concat(routes).filter((r, i, a) => r && routes.includes(r) && a.indexOf(r) === i);
             let info = null, last = null;
+            const tried = [];
             for (const rt of order) {
                 const r = await net.peek(rt, job.u, Object.assign({}, headers, playlist ? {} : { Range: 'bytes=0-2047' })).catch(e => ({ error: e.message }));
                 last = r;
+                tried.push(`${rt}:${r.error ? 'error ' + r.error.slice(0, 40) : r.status + ' ' + (r.type || '').split(';')[0] + ' ' + (r.head || '').replace(/\s+/g, ' ').slice(0, 60)}`);
                 if (r.text && /^#EXTM3U/.test(r.text.trim()) && r.status < 400) { route = rt; info = r; break; }
                 if (!r.error && isMedia(r)) { route = rt; info = r; break; }
             }
             if (!route) {
-                note({ start: new URL(job.u).host, tried: order.join('+'), status: last && (last.status || last.error) });
-                res.writeHead(502); return res.end('the video host refused every connection');
+                note({ start: new URL(job.u).host, tried: tried.join(' | ') });
+                res.writeHead(502); return res.end('refused: ' + tried.join(' | '));
             }
             if (info.text) { playlist = true; text = info.text; finalUrl = info.url; }
             else {

@@ -12,7 +12,10 @@ const { Impit } = require('impit');
 const nativeFetch = globalThis.fetch.bind(globalThis);
 const WARP_PROXY = process.env.WARP_PROXY || 'socks5://127.0.0.1:40000';
 const PROXY_URL = (process.env.PROXY_URL || '').trim();
-const TIMEOUT = Number(process.env.NET_TIMEOUT_MS) || 15000;
+const TIMEOUT = Number(process.env.NET_TIMEOUT_MS) || 20000;
+// sites known to need longer per page (KinoKing: 12-20 s)
+const SLOW = new RegExp(process.env.SLOW_HOSTS || 'kinoking', 'i');
+const timeoutFor = url => (SLOW.test(url) ? Math.max(TIMEOUT, 40000) : TIMEOUT);
 const REMEMBER_MS = 30 * 60000;
 
 const { AsyncLocalStorage } = require('async_hooks');
@@ -96,10 +99,10 @@ async function once(route, url, opts, browserLike) {
     const ua = Object.keys(headers).find(k => k.toLowerCase() === 'user-agent');
     // let the Chrome emulation send its own matching User-Agent; keep special ones like "MediaUrl/2"
     if (route !== 'node' && browserLike && ua) delete headers[ua];
-    const init = { method: opts.method || 'GET', headers };
+    const init = { method: opts.method || 'GET', headers, timeout: timeoutFor(url) };
     if (opts.body != null) init.body = opts.body;
     let res;
-    if (route === 'node') res = await nativeFetch(url, Object.assign({}, opts, { signal: opts.signal || AbortSignal.timeout(TIMEOUT) }));
+    if (route === 'node') res = await nativeFetch(url, Object.assign({}, opts, { signal: opts.signal || AbortSignal.timeout(timeoutFor(url)) }));
     else res = await client(route, browserLike).fetch(url, init);
     const buf = res.status === 204 || res.status === 304 ? new ArrayBuffer(0) : await res.arrayBuffer();
     const outHeaders = new Headers();

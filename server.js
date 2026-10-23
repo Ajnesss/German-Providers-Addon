@@ -245,7 +245,7 @@ async function playCheck(stream) {
         const type = r.headers.get('content-type') || '';
         const buf = Buffer.from(await r.arrayBuffer());
         const head = buf.toString('utf8', 0, 300);
-        if (r.status >= 400) return `FAIL ${r.status} at ${depth ? 'playlist/piece' : 'start'}`;
+        if (r.status >= 400) return `FAIL ${r.status} at ${depth ? 'playlist/piece' : 'start'}${r.status === 502 ? ' (' + buf.toString('utf8', 0, 200) + ')' : ''}`;
         if (/^#EXTM3U/.test(head.trim())) {
             const text = buf.length >= 2048 ? await (await fetch(url, { headers: Object.assign({ 'User-Agent': 'ExoPlayer' }, headers), signal: AbortSignal.timeout(20000) })).text() : buf.toString('utf8');
             const next = text.split(/\r?\n/).map(l => l.trim()).find(l => l && !l.startsWith('#'));
