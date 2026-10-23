@@ -15,6 +15,16 @@ const PROXY_URL = (process.env.PROXY_URL || '').trim();
 const TIMEOUT = Number(process.env.NET_TIMEOUT_MS) || 12000;
 const REMEMBER_MS = 30 * 60000;
 
+const { AsyncLocalStorage } = require('async_hooks');
+const traceStore = new AsyncLocalStorage();
+function trace(entry) {
+    const t = traceStore.getStore();
+    if (t && t.length < 400) t.push(Object.assign({}, entry, { url: entry.url && entry.url.slice(0, 160) }));
+}
+// console.error lines (the scrapers' own error messages) also land in the active trace
+const origError = console.error.bind(console);
+console.error = (...a) => { trace({ log: a.map(String).join(' ').slice(0, 200) }); origError(...a); };
+
 const clients = new Map();
 function client(route, browser) {
     const key = route + ':' + browser;
@@ -46,7 +56,9 @@ function startWarpWatch() {
     loop();
 }
 
-const routes = () => ['direct'].concat(warpUp ? ['warp'] : [], PROXY_URL ? ['proxy'] : []);
+// 'node': plain request exactly like before (keeps every site that already worked unchanged)
+// 'direct': Chrome-like connection, 'warp': Chrome-like through WARP, 'proxy': Chrome-like through PROXY_URL
+const routes = browserLike => ['node'].concat(browserLike ? ['direct'] : [], warpUp ? ['warp'] : [], PROXY_URL ? ['proxy'] : []);
 
 // ---------- block detection ----------
 const BLOCK_STATUS = new Set([403, 429, 503, 520, 521, 522, 523, 524, 525, 526]);
@@ -77,11 +89,11 @@ async function once(route, url, opts, browserLike) {
     const headers = plainHeaders(opts.headers);
     const ua = Object.keys(headers).find(k => k.toLowerCase() === 'user-agent');
     // let the Chrome emulation send its own matching User-Agent; keep special ones like "MediaUrl/2"
-    if (browserLike && ua) delete headers[ua];
+    if (route !== 'node' && browserLike && ua) delete headers[ua];
     const init = { method: opts.method || 'GET', headers };
     if (opts.body != null) init.body = opts.body;
     let res;
-    if (route === 'direct' && !browserLike) res = await nativeFetch(url, Object.assign({}, opts, { signal: opts.signal || AbortSignal.timeout(TIMEOUT) }));
+    if (route === 'node') res = await nativeFetch(url, Object.assign({}, opts, { signal: opts.signal || AbortSignal.timeout(TIMEOUT) }));
     else res = await client(route, browserLike).fetch(url, init);
     const buf = res.status === 204 || res.status === 304 ? new ArrayBuffer(0) : await res.arrayBuffer();
     const outHeaders = new Headers();
@@ -105,45 +117,48 @@ async function smartFetch(input, opts = {}) {
     const uaKey = Object.keys(h).find(k => k.toLowerCase() === 'user-agent');
     const browserLike = !uaKey || /Mozilla/i.test(h[uaKey]);
 
-    const all = routes();
+    const all = routes(browserLike);
     const mem = memory.get(host);
     const order = mem && mem.until > Date.now() && all.includes(mem.route) ? [mem.route].concat(all.filter(r => r !== mem.route)) : all;
 
-    let last = null, lastErr = null;
+    let last = null, lastErr = null, candidate = null, sawBlock = false;
     for (const route of order) {
+        const t = Date.now();
         try {
             const r = await once(route, url, opts, browserLike);
             r.requested = url;
-            if (!isBlocked(r.status, r.headers.get('content-type'), r.buf)) {
-                count(host, route, 'ok');
-                if (route !== 'direct') memory.set(host, { route, until: Date.now() + REMEMBER_MS });
-                else if (mem) memory.delete(host);
-                return toResponse(r);
-            }
-            count(host, route, 'blocked');
-            last = r;
+            const blocked = isBlocked(r.status, r.headers.get('content-type'), r.buf);
+            trace({ url, route, status: r.status, blocked, bytes: r.buf.byteLength, ms: Date.now() - t });
+            if (blocked) { count(host, route, 'blocked'); sawBlock = true; last = r; continue; }
+            // after a block, a 404 is often a fake "not found" for servers: try the remaining routes too
+            if (r.status === 404 && sawBlock) { count(host, route, 'blocked'); candidate = candidate || r; continue; }
+            count(host, route, 'ok');
+            if (route !== 'node') memory.set(host, { route, until: Date.now() + REMEMBER_MS });
+            else if (mem) memory.delete(host);
+            return toResponse(r);
         } catch (e) {
+            trace({ url, route, error: String(e.message || e).slice(0, 120), ms: Date.now() - t });
             count(host, route, 'error');
             lastErr = e;
         }
     }
+    if (candidate) return toResponse(candidate);
     if (last) return toResponse(last);
     throw lastErr || new Error(`fetch failed for ${url}`);
 }
 
 // ---------- diagnostics: /diag ----------
-const DIAG_URLS = ['https://voe.sx/', 'https://aniworld.to/', 'https://s.to/', 'https://huhu.to/', 'https://supervideo.cc/',
+const DIAG_URLS = ['https://voe.sx/', 'https://aniworld.to/', 'https://serienstream.to/', 'https://huhu.to/', 'https://supervideo.cc/',
     'https://luluvdo.com/', 'https://filmpalast.to/', 'https://moflix-stream.xyz/'];
 async function diag() {
     const modes = ['node', 'direct'].concat(warpUp ? ['warp'] : [], PROXY_URL ? ['proxy'] : []);
+    const urls = DIAG_URLS;
     const rows = await Promise.all(DIAG_URLS.map(async url => {
         const row = { url };
         await Promise.all(modes.map(async m => {
             const t = Date.now();
             try {
-                const r = m === 'node'
-                    ? await (async () => { const x = await nativeFetch(url, { headers: { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36' }, signal: AbortSignal.timeout(TIMEOUT) }); return { status: x.status, headers: x.headers, buf: await x.arrayBuffer() }; })()
-                    : await once(m, url, {}, true);
+                const r = await once(m, url, { headers: { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36' } }, true);
                 row[m] = `${r.status}${isBlocked(r.status, r.headers.get('content-type'), r.buf) ? ' BLOCKED' : ' ok'} ${Date.now() - t}ms`;
             } catch (e) {
                 row[m] = `ERROR ${String(e.message || e).slice(0, 60)}`;
@@ -154,4 +169,4 @@ async function diag() {
     return { warp: warpUp ? 'on' : 'off', proxy: PROXY_URL ? 'set' : 'not set', results: rows };
 }
 
-module.exports = { smartFetch, nativeFetch, startWarpWatch, checkWarp, diag, status: () => ({ warp: warpUp, proxy: !!PROXY_URL, remembered: Object.fromEntries([...memory].map(([h, m]) => [h, m.route])), stats }) };
+module.exports = { traceStore, smartFetch, nativeFetch, startWarpWatch, checkWarp, diag, status: () => ({ warp: warpUp, proxy: !!PROXY_URL, remembered: Object.fromEntries([...memory].map(([h, m]) => [h, m.route])), stats }) };

@@ -185,6 +185,31 @@ function getStreams(type, id, prefetched) {
     return promise;
 }
 
+// ---------- debug jobs (run providers one by one and record every request they make) ----------
+const jobs = new Map();
+async function runDebugJob(job, only) {
+    const [ref, s, e] = job.id.split(':');
+    const pType = job.type === 'movie' ? 'movie' : 'tv';
+    const tmdbId = /^tt\d+$/.test(ref) ? await toTmdb(ref, pType) : ref;
+    job.tmdbId = tmdbId;
+    if (!tmdbId) { job.done = true; job.error = 'no TMDB match'; return; }
+    const list = providers.filter(p => p.types.includes(pType) && (!only || only.includes(p.id)));
+    await Promise.all(list.map(async p => {
+        const entry = job.providers[p.id] = { running: true, requests: [] };
+        const t = Date.now();
+        await net.traceStore.run(entry.requests, async () => {
+            try {
+                const streams = (await runProvider(p, tmdbId, pType, s ? Number(s) : null, e ? Number(e) : null)) || [];
+                entry.streams = streams.length;
+                entry.sample = streams.slice(0, 3).map(x => `${x.name} | ${(x.url || '').slice(0, 70)}`);
+            } catch (err) { entry.error = err.message; }
+        });
+        entry.ms = Date.now() - t;
+        entry.running = false;
+    }));
+    job.done = true;
+}
+
 // ---------- HTTP server ----------
 const relayAlive = () => !!relay && Date.now() - relay.time < 12 * 60000;
 
@@ -220,8 +245,21 @@ const server = http.createServer(async (req, res) => {
         return send(res, 200, { ok: true, homeRelay: relayAlive() ? 'online' : 'offline', addon: `${req.headers['x-forwarded-proto'] || 'http'}://${req.headers.host}/manifest.json`, plugins: pluginVersion, providers: providers.map(p => p.id), tmdbKey: !!TMDB_API_KEY });
     }
     if (url === '/manifest.json') return send(res, 200, addonManifest(), 3600);
-    if (url === '/diag') return send(res, 200, await net.diag());
-    if (url === '/net') return send(res, 200, net.status());
+    if (url === '/diag' || url.startsWith('/diag/')) return send(res, 200, await net.diag());
+    if (url === '/net' || url.startsWith('/net/')) return send(res, 200, net.status());
+
+    // debug jobs: /debug/start/series/tt1199099:1:1[/serienstream,huhuto]  ->  { job }   then  /debug/job/<job>
+    const ds = url.match(/^\/debug\/start\/(movie|series)\/([^/]+?)(?:\/([a-z0-9,]+))?\/?$/);
+    if (ds) {
+        const id = Math.random().toString(36).slice(2, 8);
+        const job = { started: new Date().toISOString(), type: ds[1], id: ds[2], done: false, providers: {} };
+        jobs.set(id, job);
+        if (jobs.size > 30) jobs.delete(jobs.keys().next().value);
+        runDebugJob(job, ds[3] ? ds[3].split(',') : null).catch(e => { job.error = e.message; job.done = true; });
+        return send(res, 200, { job: id, result: `/debug/job/${id}` });
+    }
+    const dj = url.match(/^\/debug\/job\/([a-z0-9]+)/);
+    if (dj) return send(res, 200, jobs.get(dj[1]) || { error: 'unknown job' });
 
     // ---- home relay ----
     const q = new URL(req.url || '/', 'http://x').searchParams;
