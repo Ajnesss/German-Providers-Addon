@@ -5,6 +5,10 @@
 'use strict';
 
 const http = require('http');
+const net = require('./net.js');
+// the scrapers call the global fetch(): route it through the Chrome-like / WARP connection layer
+globalThis.fetch = net.smartFetch;
+const fetch = net.nativeFetch;   // this file's own calls (TMDB lookup, updates, relay) stay plain
 const fs = require('fs');
 const path = require('path');
 
@@ -187,7 +191,7 @@ const relayAlive = () => !!relay && Date.now() - relay.time < 12 * 60000;
 function addonManifest() {
     return {
         id: 'community.german-providers.addon',
-        version: '1.0.0',
+        version: '1.1.0',
         name: 'German Providers',
         description: `Deutsche Quellen (s.to, AniWorld, ARD, Arte, FilmPalast …) als Addon. Plugins v${pluginVersion} von InvalidPandaa/nuvio-german-providers (GPL-3.0).`,
         logo: 'https://flagcdn.com/w160/de.png',
@@ -216,6 +220,8 @@ const server = http.createServer(async (req, res) => {
         return send(res, 200, { ok: true, homeRelay: relayAlive() ? 'online' : 'offline', addon: `${req.headers['x-forwarded-proto'] || 'http'}://${req.headers.host}/manifest.json`, plugins: pluginVersion, providers: providers.map(p => p.id), tmdbKey: !!TMDB_API_KEY });
     }
     if (url === '/manifest.json') return send(res, 200, addonManifest(), 3600);
+    if (url === '/diag') return send(res, 200, await net.diag());
+    if (url === '/net') return send(res, 200, net.status());
 
     // ---- home relay ----
     const q = new URL(req.url || '/', 'http://x').searchParams;
@@ -285,6 +291,7 @@ if (require.main === module) {
     loadFrom(BUNDLED_DIR);
     if (!TMDB_API_KEY) log('WARNING: TMDB_API_KEY is not set, every lookup will return nothing');
     server.listen(PORT, () => log(`German Providers addon on http://localhost:${PORT}/manifest.json`));
+    net.startWarpWatch();
     if (AUTO_UPDATE) { update(); setInterval(update, UPDATE_HOURS * 3600000).unref(); }
 }
 
