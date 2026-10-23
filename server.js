@@ -217,6 +217,71 @@ async function runDebugJob(job, only) {
     job.done = true;
 }
 
+// ---------- full audit: every provider x test titles, and a real play check of the streams ----------
+const AUDIT_TITLES = (process.env.AUDIT_TITLES ||
+    'movie:tt0133093,movie:tt1375666,series:tt0944947:1:1,series:tt0458290:1:1,series:tt1199099:1:1,series:tt0388629:1:1,series:tt0121955:1:1,series:tt5753856:1:1,series:tt1871731:1:1')
+    .split(',').map(x => { const [type, ...id] = x.split(':'); return { type, id: id.join(':') }; });
+
+// play a stream like the player would: playlist -> first quality -> first video piece (first 2 KB only)
+async function playCheck(stream) {
+    const local = publicBase ? stream.url.replace(publicBase, `http://127.0.0.1:${PORT}`) : stream.url;
+    const headers = Object.assign({}, ((stream.behaviorHints || {}).proxyHeaders || {}).request);
+    let url = local;
+    for (let depth = 0; depth < 4; depth++) {
+        const r = await fetch(url, { headers: Object.assign({ 'User-Agent': 'ExoPlayer' }, headers, { Range: 'bytes=0-2047' }), signal: AbortSignal.timeout(20000) });
+        const type = r.headers.get('content-type') || '';
+        const buf = Buffer.from(await r.arrayBuffer());
+        const head = buf.toString('utf8', 0, 300);
+        if (r.status >= 400) return `FAIL ${r.status} at ${depth ? 'playlist/piece' : 'start'}`;
+        if (/^#EXTM3U/.test(head.trim())) {
+            const text = buf.length >= 2048 ? await (await fetch(url, { headers: Object.assign({ 'User-Agent': 'ExoPlayer' }, headers), signal: AbortSignal.timeout(20000) })).text() : buf.toString('utf8');
+            const next = text.split(/\r?\n/).map(l => l.trim()).find(l => l && !l.startsWith('#'));
+            if (!next) return 'FAIL empty playlist';
+            url = new URL(next, r.url || url).toString();
+            if (publicBase) url = url.replace(publicBase, `http://127.0.0.1:${PORT}`);
+            continue;
+        }
+        if (/html/i.test(type) || /^\s*</.test(head)) return `FAIL got a web page (${r.status})`;
+        return `OK ${r.status} ${type.split(';')[0] || 'data'}`;
+    }
+    return 'FAIL too many playlists';
+}
+
+const audits = new Map();
+async function runAudit(audit) {
+    for (const t of AUDIT_TITLES) {
+        const row = audit.titles[`${t.type}:${t.id}`] = {};
+        const [ref, s, e] = t.id.split(':');
+        const pType = t.type === 'movie' ? 'movie' : 'tv';
+        const tmdbId = await toTmdb(ref, pType).catch(() => null);
+        if (!tmdbId) { row.error = 'no TMDB match'; continue; }
+        await Promise.all(providers.filter(p => p.types.includes(pType)).map(async p => {
+            const reqs = [];
+            const t0 = Date.now();
+            let list = [];
+            await net.traceStore.run(reqs, async () => {
+                try { list = (await runProvider(p, tmdbId, pType, s ? Number(s) : null, e ? Number(e) : null)) || []; }
+                catch (err) { reqs.push({ log: 'ERROR ' + err.message }); }
+            });
+            const blockedHosts = [...new Set(reqs.filter(r => r.blocked).map(r => { try { return new URL(r.url).host; } catch (x) { return '?'; } }))];
+            const stillBlocked = blockedHosts.filter(h => !reqs.some(r => r.url && r.url.includes(h) && r.status && !r.blocked));
+            const out = { streams: list.length, ms: Date.now() - t0 };
+            if (stillBlocked.length) out.blocked = stillBlocked;
+            const errs = reqs.filter(r => r.error || r.log).map(r => (r.error ? `${r.route} ${r.error}` : r.log).slice(0, 90));
+            if (errs.length) out.errors = errs.slice(0, 3);
+            // play check of up to 3 streams (different hosts first)
+            const addon = list.map(x => toAddonStream(x, p).stream);
+            const seen = new Set(), pick = [];
+            for (const a of addon) { const host = (a.title.split('\n')[1] || '').split(' · ')[0]; if (!seen.has(host)) { seen.add(host); pick.push(a); } if (pick.length >= 3) break; }
+            if (pick.length) out.play = await Promise.all(pick.map(async a => `${(a.title.split('\n')[1] || a.title).split(' · ')[0].slice(0, 24)}: ${await playCheck(a).catch(err => 'FAIL ' + err.message.slice(0, 50))}`));
+            row[p.id] = out;
+        }));
+        audit.progress = Object.keys(audit.titles).length + '/' + AUDIT_TITLES.length;
+    }
+    audit.done = true;
+    audit.finished = new Date().toISOString();
+}
+
 // ---------- HTTP server ----------
 const relayAlive = () => !!relay && Date.now() - relay.time < 12 * 60000;
 
@@ -269,6 +334,15 @@ const server = http.createServer(async (req, res) => {
         runDebugJob(job, ds[3] ? ds[3].split(',') : null).catch(e => { job.error = e.message; job.done = true; });
         return send(res, 200, { job: id, result: `/debug/job/${id}` });
     }
+    if (url.startsWith('/audit/start')) {
+        const id = Math.random().toString(36).slice(2, 8);
+        const audit = { started: new Date().toISOString(), done: false, progress: '0/' + AUDIT_TITLES.length, titles: {} };
+        audits.set(id, audit);
+        runAudit(audit).catch(e => { audit.error = e.message; audit.done = true; });
+        return send(res, 200, { audit: id, result: `/audit/job/${id}` });
+    }
+    const aj = url.match(/^\/audit\/job\/([a-z0-9]+)/);
+    if (aj) return send(res, 200, audits.get(aj[1]) || { error: 'unknown audit' });
     const dj = url.match(/^\/debug\/job\/([a-z0-9]+)/);
     if (dj) return send(res, 200, jobs.get(dj[1]) || { error: 'unknown job' });
 
