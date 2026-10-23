@@ -12,7 +12,7 @@ const { Impit } = require('impit');
 const nativeFetch = globalThis.fetch.bind(globalThis);
 const WARP_PROXY = process.env.WARP_PROXY || 'socks5://127.0.0.1:40000';
 const PROXY_URL = (process.env.PROXY_URL || '').trim();
-const TIMEOUT = Number(process.env.NET_TIMEOUT_MS) || 12000;
+const TIMEOUT = Number(process.env.NET_TIMEOUT_MS) || 20000;
 const REMEMBER_MS = 30 * 60000;
 
 const { AsyncLocalStorage } = require('async_hooks');
@@ -63,11 +63,17 @@ const routes = browserLike => ['node'].concat(browserLike ? ['direct'] : [], war
 // ---------- block detection ----------
 const BLOCK_STATUS = new Set([403, 429, 503, 520, 521, 522, 523, 524, 525, 526]);
 const CHALLENGE = /Just a moment\.\.\.|cf-chl|_cf_chl_opt|challenge-platform|Attention Required! \| Cloudflare|DDoS-Guard|ddos-guard\/js|Checking your browser/i;
+// small pages that are only a captcha (s.to/AniWorld show one instead of redirecting after ~10 links per IP)
+const CAPTCHA = /captcha|turnstile|cf-turnstile|h-captcha|g-recaptcha/i;
 function isBlocked(status, type, buf) {
     if (BLOCK_STATUS.has(status)) return true;
     if (status >= 400 || !/html/i.test(type || '') || buf.byteLength > 60000) return false;
-    return CHALLENGE.test(Buffer.from(buf).toString('utf8', 0, Math.min(buf.byteLength, 6000)));
+    const head = Buffer.from(buf).toString('utf8', 0, Math.min(buf.byteLength, 6000));
+    return CHALLENGE.test(head) || (buf.byteLength < 8000 && CAPTCHA.test(head));
 }
+const snippet = (type, buf) => buf.byteLength && buf.byteLength < 4000 && /html|text|json/i.test(type || '')
+    ? Buffer.from(buf).toString('utf8').replace(/\s+/g, ' ').slice(0, 300) : undefined;
+const isTimeout = e => /timeout|timed out|aborted/i.test(String(e && (e.message || e.name) || e));
 
 // ---------- per-site memory and stats ----------
 const memory = new Map();   // host -> { route, until }
@@ -128,7 +134,7 @@ async function smartFetch(input, opts = {}) {
             const r = await once(route, url, opts, browserLike);
             r.requested = url;
             const blocked = isBlocked(r.status, r.headers.get('content-type'), r.buf);
-            trace({ url, route, status: r.status, blocked, bytes: r.buf.byteLength, ms: Date.now() - t });
+            trace({ url, route, status: r.status, blocked, bytes: r.buf.byteLength, ms: Date.now() - t, snippet: snippet(r.headers.get('content-type'), r.buf) });
             if (blocked) { count(host, route, 'blocked'); sawBlock = true; last = r; continue; }
             // after a block, a 404 is often a fake "not found" for servers: try the remaining routes too
             if (r.status === 404 && sawBlock) { count(host, route, 'blocked'); candidate = candidate || r; continue; }
@@ -140,6 +146,8 @@ async function smartFetch(input, opts = {}) {
             trace({ url, route, error: String(e.message || e).slice(0, 120), ms: Date.now() - t });
             count(host, route, 'error');
             lastErr = e;
+            // a slow site stays slow on every route: don't spend another 20 s per route on it
+            if (isTimeout(e) && !sawBlock) break;
         }
     }
     if (candidate) return toResponse(candidate);
