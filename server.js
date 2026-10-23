@@ -398,6 +398,41 @@ const server = http.createServer(async (req, res) => {
         runAudit(audit).catch(e => { audit.error = e.message; audit.done = true; });
         return send(res, 200, { audit: id, result: `/audit/job/${id}` });
     }
+    // s.to gate inspection: /debug/sto/<episode path>  e.g. /debug/sto/serie/die-legende-von-korra/staffel-1/episode-1
+    if (url.startsWith('/debug/sto/') || url.startsWith('/debug/sto-part/')) {
+        const part = url.startsWith('/debug/sto-part/');
+        const rest = url.replace(/^\/debug\/sto(-part)?\//, '');
+        const [pathPart, sectionText] = part ? [rest.replace(/\/(\d+)$/, ''), (rest.match(/\/(\d+)$/) || [])[1]] : [rest, null];
+        try {
+            const base = 'https://serienstream.to';
+            const epUrl = `${base}/${pathPart}`;
+            const ep = await net.smartFetch(epUrl, { headers: { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36' } });
+            const html = await ep.text();
+            const play = (html.match(/data-play-url="([^"]+)"/) || [])[1];
+            const dlgAt = html.indexOf('Video wird vorbereitet');
+            const scripts = [...html.matchAll(/<script[^>]*src="([^"]+)"/g)].map(m => m[1]);
+            const inline = [...html.matchAll(/<script(?![^>]*src=)[^>]*>([\s\S]*?)<\/script>/g)].map(m => m[1].trim()).filter(Boolean);
+            let r = null;
+            if (play) {
+                const rr = await net.smartFetch(base + play.replace(/&amp;/g, '&'), { headers: { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36', Referer: epUrl } });
+                r = { status: rr.status, finalUrl: rr.url, setCookie: rr.headers.get('set-cookie'), body: await rr.text() };
+            }
+            const report = {
+                episode: { status: ep.status, bytes: html.length, playUrlFound: !!play, scriptSrcs: scripts,
+                    dialogHtml: dlgAt >= 0 ? html.slice(Math.max(0, dlgAt - 1500), dlgAt + 2500) : null,
+                    inlineScriptsMentioningPlay: inline.filter(x => /play|weiter|step|captcha|turnstile|redirect|\/r\?/i.test(x)).map(x => x.slice(0, 3000)) },
+                redirect: r,
+            };
+            if (part) {
+                // the same report as plain text in 1500-character pieces (my reader quotes small pieces more reliably)
+                const text = JSON.stringify(report, null, 1);
+                const n = Number(sectionText) || 0;
+                res.writeHead(200, { 'Content-Type': 'text/plain; charset=utf-8' });
+                return res.end(`piece ${n} of ${Math.ceil(text.length / 1500) - 1}\n` + text.slice(n * 1500, n * 1500 + 1500));
+            }
+            return send(res, 200, report);
+        } catch (e) { return send(res, 200, { error: e.message }); }
+    }
     const aj = url.match(/^\/audit\/job\/([a-z0-9]+)/);
     if (aj) return send(res, 200, audits.get(aj[1]) || { error: 'unknown audit' });
     const dj = url.match(/^\/debug\/job\/([a-z0-9]+)/);
