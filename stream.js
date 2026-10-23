@@ -8,6 +8,10 @@ const crypto = require('crypto');
 const net = require('./net.js');
 
 const MODE = (process.env.STREAM_PROXY || 'auto').toLowerCase();      // auto | all | off
+// official broadcasters (public HLS, not tied to an IP) always play directly; set STREAM_PROXY=hosts to only pass
+// through the hosts in STREAM_PROXY_HOSTS, or =all / =off
+const DIRECT_PROVIDERS = (process.env.DIRECT_PROVIDERS || 'ard,arte,plutotv,dmax,tele5,tlc,southpark,netzkino')
+    .split(',').map(s => s.trim().toLowerCase()).filter(Boolean);
 const HOSTS = (process.env.STREAM_PROXY_HOSTS || 'voe,vidmoly,filemoon,streamwish,byse,bysezejataos,derricknationtop,cloudwindow-route')
     .split(',').map(s => s.trim().toLowerCase()).filter(Boolean);
 const SECRET = process.env.STREAM_SECRET || process.env.TMDB_API_KEY || 'german-providers';
@@ -33,8 +37,8 @@ async function segmentsDirect(segUrl, headers) {
     if (overCap()) direct = true;
     else if (net.warpOn()) {
         try {
-            const r = await net.probe('warp', segUrl, { headers: Object.assign({}, headers, { Range: 'bytes=0-2047' }) });
-            direct = (r.status === 200 || r.status === 206) && !/html|json/i.test(r.headers.get('content-type') || '');
+            const r = await net.peek('warp', segUrl, Object.assign({}, headers, { Range: 'bytes=0-2047' }));
+            direct = (r.status === 200 || r.status === 206) && r.first > 0 && !/html|json|text\/plain/i.test(r.type);
         } catch (e) { direct = false; }
     }
     segDecision.set(host, { direct, until: Date.now() + 6 * 3600000 });
@@ -45,11 +49,13 @@ const b64 = s => Buffer.from(s).toString('base64url');
 const unb64 = s => Buffer.from(s, 'base64url').toString('utf8');
 const sign = data => crypto.createHmac('sha256', SECRET).update(data).digest('base64url').slice(0, 16);
 
-function wanted(stream, label) {
+function wanted(stream, label, providerId) {
     if (MODE === 'off' || !/^https?:/.test(stream.url || '')) return false;
     if (MODE === 'all') return true;
     const text = `${label || ''} ${stream.name || ''} ${stream.title || ''} ${stream.url}`.toLowerCase();
-    return HOSTS.some(h => text.includes(h));
+    if (MODE === 'hosts') return HOSTS.some(h => text.includes(h));
+    // auto: every hoster stream goes via here; whether the video itself does is tested per host (ipFree)
+    return !DIRECT_PROVIDERS.includes(String(providerId || '').toLowerCase());
 }
 
 function proxyUrl(base, url, headers) {
@@ -113,7 +119,11 @@ async function handle(req, res, base) {
         res.writeHead(up.status, { 'Content-Type': type || 'text/plain' });
         return res.end(text);
     }
-    if (overCap()) { res.writeHead(302, { Location: job.u }); return res.end(); }
+    // a whole file or a video piece: send the player straight to the host when the link isn't tied to this server's IP
+    if (overCap() || (!isPlaylist(job.u, type) && await segmentsDirect(job.u, job.h))) {
+        try { up.body && up.body.cancel(); } catch (e) {}
+        res.writeHead(302, { Location: job.u, 'Access-Control-Allow-Origin': '*' }); return res.end();
+    }
     const out = { 'Access-Control-Allow-Origin': '*' };
     for (const k of PASS) { const v = up.headers.get(k); if (v) out[k] = v; }
     res.writeHead(up.status, out);

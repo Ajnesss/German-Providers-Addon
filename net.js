@@ -177,4 +177,18 @@ async function diag() {
     return { warp: warpUp ? 'on' : 'off', proxy: PROXY_URL ? 'set' : 'not set', results: rows };
 }
 
-module.exports = { probe: (route, url, opts) => once(route, url, opts || {}, true), warpOn: () => warpUp, traceStore, smartFetch, nativeFetch, startWarpWatch, checkWarp, diag, status: () => ({ warp: warpUp, proxy: !!PROXY_URL, remembered: Object.fromEntries([...memory].map(([h, m]) => [h, m.route])), stats }) };
+// fetch only the start of a (possibly huge) file through a route: status + type, then hang up
+async function peek(route, url, headers) {
+    const h = Object.assign({}, headers);
+    for (const k of Object.keys(h)) if (k.toLowerCase() === 'user-agent') delete h[k];
+    const ac = new AbortController();
+    const timer = setTimeout(() => ac.abort(), 10000);
+    try {
+        const r = await client(route, true).fetch(url, { headers: h, signal: ac.signal });
+        let first = 0;
+        if (r.body) { const rd = r.body.getReader(); const { value } = await rd.read(); first = value ? value.length : 0; rd.cancel().catch(() => {}); }
+        return { status: r.status, type: r.headers.get('content-type') || '', first };
+    } finally { clearTimeout(timer); ac.abort(); }
+}
+
+module.exports = { peek, probe: (route, url, opts) => once(route, url, opts || {}, true), warpOn: () => warpUp, traceStore, smartFetch, nativeFetch, startWarpWatch, checkWarp, diag, status: () => ({ warp: warpUp, proxy: !!PROXY_URL, remembered: Object.fromEntries([...memory].map(([h, m]) => [h, m.route])), stats }) };
