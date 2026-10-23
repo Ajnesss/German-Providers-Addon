@@ -73,7 +73,8 @@ async function rewritePlaylist(text, baseUrl, base, headers, route) {
         const first = lines.find(l => l.trim() && !l.trim().startsWith('#'));
         if (first) {
             const seg = await reach(abs(first.trim()), headers);
-            direct = overCap() || (seg.ok.length > 1 && seg.ok.length === seg.all.length);
+            // pieces go straight to the player only if every connection can load them and no session cookie is involved
+            direct = overCap() || (seg.ok.length > 1 && seg.ok.length === seg.all.length && !net.hasCookie(abs(first.trim())));
             if (!direct && seg.ok.length) segRoute = seg.ok.includes(route) ? route : seg.ok[0];
             note({ pieces: new URL(abs(first.trim())).host, works: seg.ok.join('+') || 'none', via: direct ? 'player direct' : 'server/' + segRoute });
         }

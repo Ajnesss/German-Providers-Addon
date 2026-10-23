@@ -180,12 +180,36 @@ async function diag() {
     return { warp: warpUp ? 'on' : 'off', proxy: PROXY_URL ? 'set' : 'not set', results: rows };
 }
 
+// small cookie jar for video hosts that expect the cookie from the playlist on the next requests
+const jar = new Map();   // host -> { name: value }
+function cookieHeader(url) {
+    try { const c = jar.get(new URL(url).host); return c && Object.keys(c).length ? Object.entries(c).map(([k, v]) => `${k}=${v}`).join('; ') : null; } catch (e) { return null; }
+}
+function storeCookies(url, res) {
+    try {
+        const raw = typeof res.headers.getSetCookie === 'function' ? res.headers.getSetCookie() : [res.headers.get('set-cookie')].filter(Boolean);
+        if (!raw.length) return;
+        const host = new URL(res.url || url).host;
+        const c = jar.get(host) || {};
+        for (const line of raw.join('\n').split(/\n|,(?=\s*[^;,=\s]+=)/)) { const m = line.trim().match(/^([^=;\s]+)=([^;]*)/); if (m) c[m[1]] = m[2]; }
+        jar.set(host, c);
+        if (jar.size > 300) jar.delete(jar.keys().next().value);
+    } catch (e) { /* ignore */ }
+}
+
 // open a URL through one specific route without buffering (video pieces / files): status, headers, body stream
 async function open(route, url, headers, signal) {
     const h = Object.assign({}, headers);
-    if (route === 'node') return nativeFetch(url, { headers: h, signal });
-    for (const k of Object.keys(h)) if (k.toLowerCase() === 'user-agent') delete h[k];
-    return client(route, true).fetch(url, { headers: h, signal });
+    const cookie = cookieHeader(url);
+    if (cookie && !Object.keys(h).some(k => k.toLowerCase() === 'cookie')) h.Cookie = cookie;
+    let res;
+    if (route === 'node') res = await nativeFetch(url, { headers: h, signal });
+    else {
+        for (const k of Object.keys(h)) if (k.toLowerCase() === 'user-agent') delete h[k];
+        res = await client(route, true).fetch(url, { headers: h, signal });
+    }
+    storeCookies(url, res);
+    return res;
 }
 
 // fetch only the start of a (possibly huge) file through a route: status + type, then hang up
@@ -215,4 +239,4 @@ async function peek(route, url, headers) {
 
 const availableRoutes = () => ['node'].concat(warpUp ? ['warp'] : [], PROXY_URL ? ['proxy'] : []);
 
-module.exports = { rememberedRoute: host => { const m = memory.get(host); return m && m.until > Date.now() ? m.route : null; }, open, availableRoutes, peek, probe: (route, url, opts) => once(route, url, opts || {}, true), warpOn: () => warpUp, traceStore, smartFetch, nativeFetch, startWarpWatch, checkWarp, diag, status: () => ({ warp: warpUp, proxy: !!PROXY_URL, remembered: Object.fromEntries([...memory].map(([h, m]) => [h, m.route])), stats }) };
+module.exports = { hasCookie: url => !!cookieHeader(url), rememberedRoute: host => { const m = memory.get(host); return m && m.until > Date.now() ? m.route : null; }, open, availableRoutes, peek, probe: (route, url, opts) => once(route, url, opts || {}, true), warpOn: () => warpUp, traceStore, smartFetch, nativeFetch, startWarpWatch, checkWarp, diag, status: () => ({ warp: warpUp, proxy: !!PROXY_URL, remembered: Object.fromEntries([...memory].map(([h, m]) => [h, m.route])), stats }) };

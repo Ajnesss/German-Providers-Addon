@@ -188,7 +188,9 @@ async function lookup(type, id) {
 const PREFERRED = (process.env.PROVIDER_ORDER || 'serienstream,aniworld,huhuto,moflix,filmpalast,megakino,kinoking,hdfilme,filmo,kellerkino,flixitv,filmfrei24,ard,arte,dmax,tele5,tlc,southpark,netzkino,plutotv')
     .split(',').map(x => x.trim());
 const prefIndex = id => { const i = PREFERRED.indexOf(id); return i < 0 ? PREFERRED.length : i; };
-const sortStreams = list => list.slice().sort((a, b) => a.rank - b.rank || a.pref - b.pref || a.order - b.order || a.i - b.i).map(x => x.stream);
+const DEMOTE = new RegExp(process.env.DEMOTE_HOSTS || 'supervideo|dropload|dr0pstream', 'i');
+const demoted = x => (DEMOTE.test(`${x.stream.title} ${x.stream.name}`) ? 1 : 0);
+const sortStreams = list => list.slice().sort((a, b) => demoted(a) - demoted(b) || a.rank - b.rank || a.pref - b.pref || a.order - b.order || a.i - b.i).map(x => x.stream);
 
 function getStreams(type, id, prefetched) {
     const key = `${type}:${id}`;
