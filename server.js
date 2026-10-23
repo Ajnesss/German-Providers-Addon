@@ -6,6 +6,8 @@
 
 const http = require('http');
 const net = require('./net.js');
+const passthrough = require('./stream.js');
+let publicBase = (process.env.PUBLIC_URL || '').replace(/\/$/, '');   // learnt from the first request if not set
 // the scrapers call the global fetch(): route it through the Chrome-like / WARP connection layer
 globalThis.fetch = net.smartFetch;
 const fetch = net.nativeFetch;   // this file's own calls (TMDB lookup, updates, relay) stay plain
@@ -116,11 +118,16 @@ function toAddonStream(s, provider) {
     const key = LANG_KEY(lang);
     const flag = key === 'de' ? '🇩🇪' : key === 'de-sub' ? '🇩🇪 UT' : '🌐';
     const quality = s.quality || 'auto';
-    const headers = s.headers && Object.keys(s.headers).length ? s.headers : null;
+    let headers = s.headers && Object.keys(s.headers).length ? s.headers : null;
+    let url = s.url;
+    // hosts like VOE only play on the connection that found the link: pass those through this server
+    if (publicBase && passthrough.wanted(s, parts.join(' '))) {
+        url = passthrough.proxyUrl(publicBase, s.url, headers);
+    }
     const out = {
         name: `${flag} DE Providers\n${quality}`,
         title: [`${parts[0]} · ${lang}`, s.title].filter(Boolean).join('\n'),
-        url: s.url,
+        url,
         behaviorHints: {
             // same group on every episode -> Nuvio/Stremio pick this addon again for the next episode
             bingeGroup: `german-providers-${key}`,
@@ -239,6 +246,10 @@ function send(res, code, body, maxAge) {
 }
 
 const server = http.createServer(async (req, res) => {
+    if (!process.env.PUBLIC_URL && req.headers.host && !/^(localhost|127\.|10\.|192\.168\.)/.test(req.headers.host)) {
+        publicBase = `${req.headers['x-forwarded-proto'] || 'http'}://${req.headers.host}`;
+    }
+    if ((req.url || '').startsWith('/p/')) return passthrough.handle(req, res, publicBase || `http://${req.headers.host}`);
     const url = decodeURIComponent((req.url || '/').split('?')[0]);
     if (req.method === 'OPTIONS') return send(res, 204, {});
     if (url === '/' || url === '/health') {
@@ -246,7 +257,7 @@ const server = http.createServer(async (req, res) => {
     }
     if (url === '/manifest.json') return send(res, 200, addonManifest(), 3600);
     if (url === '/diag' || url.startsWith('/diag/')) return send(res, 200, await net.diag());
-    if (url === '/net' || url.startsWith('/net/')) return send(res, 200, net.status());
+    if (url === '/net' || url.startsWith('/net/')) return send(res, 200, Object.assign(net.status(), { passthrough: passthrough.usage() }));
 
     // debug jobs: /debug/start/series/tt1199099:1:1[/serienstream,huhuto]  ->  { job }   then  /debug/job/<job>
     const ds = url.match(/^\/debug\/start\/(movie|series)\/([^/]+?)(?:\/([a-z0-9,]+))?\/?$/);
@@ -333,4 +344,4 @@ if (require.main === module) {
     if (AUTO_UPDATE) { update(); setInterval(update, UPDATE_HOURS * 3600000).unref(); }
 }
 
-module.exports = { _setRelay: r => { relay = r; }, server, loadFrom, toAddonStream, getStreams, _cache: cache, _providers: () => providers };
+module.exports = { _setBase: b => { publicBase = b; }, _setRelay: r => { relay = r; }, server, loadFrom, toAddonStream, getStreams, _cache: cache, _providers: () => providers };
