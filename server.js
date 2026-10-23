@@ -152,12 +152,52 @@ function toAddonStream(s, provider) {
 // ---------- the stream lookup with cache ----------
 const cache = new Map();   // key -> { time, ttl, promise }
 
+// ---------- anime IDs (kitsu:/mal:/anilist:/anidb:) -> TMDB id + season/episode, via api.ani.zip ----------
+const ANIME_PREFIXES = ['kitsu', 'mal', 'anilist', 'anidb'];
+const animeMaps = new Map();
+async function animeMapping(kind, animeId) {
+    const key = `${kind}:${animeId}`;
+    if (animeMaps.has(key)) return animeMaps.get(key);
+    const res = await fetch(`https://api.ani.zip/mappings?${kind}_id=${encodeURIComponent(animeId)}`, { signal: AbortSignal.timeout(10000) });
+    if (!res.ok) throw new Error(`ani.zip HTTP ${res.status}`);
+    const d = await res.json();
+    animeMaps.set(key, d);
+    if (animeMaps.size > 500) animeMaps.delete(animeMaps.keys().next().value);
+    return d;
+}
+// "kitsu:1376:5" -> { tmdbId, pType, season, episode }
+async function resolveAnimeId(id) {
+    const [kind, animeId, epText] = id.split(':');
+    const d = await animeMapping(kind, animeId);
+    const m = d.mappings || {};
+    const movie = /movie/i.test(m.type || '') || !epText;
+    const pType = movie ? 'movie' : 'tv';
+    let tmdbId = m.themoviedb_id ? String(m.themoviedb_id) : null;
+    if (!tmdbId && m.imdb_id) tmdbId = await toTmdb(m.imdb_id, pType);
+    if (!tmdbId) return null;
+    if (movie) return { tmdbId, pType, season: null, episode: null };
+    const n = Number(epText) || 1;
+    const ep = (d.episodes || {})[String(n)] || {};
+    // seasons as the TV listings number them; without that, absolute numbering (the anime scrapers map it to seasons)
+    const season = Number(ep.seasonNumber) > 0 ? Number(ep.seasonNumber) : 1;
+    const episode = Number(ep.episodeNumber) > 0 ? Number(ep.episodeNumber) : (Number(ep.absoluteEpisodeNumber) || n);
+    return { tmdbId, pType, season, episode };
+}
+
 async function lookup(type, id) {
-    const [imdbOrTmdb, s, e] = id.split(':').filter(x => x !== 'tmdb');
-    const season = type === 'series' ? Number(s) : null;
-    const episode = type === 'series' ? Number(e) : null;
-    const pType = type === 'movie' ? 'movie' : 'tv';
-    const tmdbId = /^tt\d+$/.test(imdbOrTmdb) ? await toTmdb(imdbOrTmdb, pType) : imdbOrTmdb;
+    let tmdbId, pType, season, episode;
+    if (ANIME_PREFIXES.includes(id.split(':')[0])) {
+        const a = await resolveAnimeId(id).catch(e => { log(`  anime id ${id}: ${e.message}`); return null; });
+        if (!a) return [];
+        ({ tmdbId, pType, season, episode } = a);
+        log(`  ${id} -> tmdb ${tmdbId} ${pType === 'tv' ? `S${season}E${episode}` : '(movie)'}`);
+    } else {
+        const [imdbOrTmdb, s, e] = id.split(':').filter(x => x !== 'tmdb');
+        season = type === 'series' ? Number(s) : null;
+        episode = type === 'series' ? Number(e) : null;
+        pType = type === 'movie' ? 'movie' : 'tv';
+        tmdbId = /^tt\d+$/.test(imdbOrTmdb) ? await toTmdb(imdbOrTmdb, pType) : imdbOrTmdb;
+    }
     if (!tmdbId) return [];
 
     const active = providers.filter(p => p.types.includes(pType));
@@ -303,13 +343,13 @@ const relayAlive = () => !!relay && Date.now() - relay.time < 12 * 60000;
 function addonManifest() {
     return {
         id: 'community.german-providers.addon',
-        version: '1.1.0',
+        version: '1.2.0',
         name: 'German Providers',
         description: `Deutsche Quellen (s.to, AniWorld, ARD, Arte, FilmPalast …) als Addon. Plugins v${pluginVersion} von InvalidPandaa/nuvio-german-providers (GPL-3.0).`,
         logo: 'https://flagcdn.com/w160/de.png',
         resources: ['stream'],
         types: ['movie', 'series'],
-        idPrefixes: ['tt', 'tmdb:'],
+        idPrefixes: ['tt', 'tmdb:', 'kitsu:', 'mal:', 'anilist:', 'anidb:'],
         catalogs: [],
         behaviorHints: { configurable: false },
     };
