@@ -53,8 +53,11 @@ function wanted(stream, label, providerId) {
     return !DIRECT_PROVIDERS.includes(String(providerId || '').toLowerCase());
 }
 
-function proxyUrl(base, url, headers, route) {
-    const data = b64(JSON.stringify(route ? { u: url, h: headers || {}, r: route } : { u: url, h: headers || {} }));
+function proxyUrl(base, url, headers, route, source) {
+    const job = { u: url, h: headers || {} };
+    if (route) job.r = route;
+    if (source) job.s = source;     // the host whose page produced this link (e.g. supervideo.cc)
+    const data = b64(JSON.stringify(job));
     const name = /\.m3u8(\?|$)/i.test(url) ? 'index.m3u8' : (url.split('?')[0].split('/').pop() || 'file').replace(/[^\w.-]/g, '').slice(-40) || 'file';
     return `${base}/p/${sign(data)}/${data}/${name}`;
 }
@@ -123,23 +126,37 @@ async function handle(req, res, base) {
     try {
         let route = job.r;
         let playlist = /\.m3u8(\?|$)/i.test(job.u);
+        let text = null, finalUrl = job.u;
         if (!route) {
-            // first request of a stream: find out which connection(s) can load it
-            const r = await reach(job.u, headers);
-            if (!r.ok.length) {
-                note({ start: new URL(job.u).host, works: 'none', status: r.info ? r.info.status : 'error' });
+            // first request of a stream. Links can be single-use, so try one connection at a time, starting with the one
+            // that opened the page this link came from, and keep the playlist we get instead of loading it twice.
+            const routes = net.availableRoutes();
+            const pref = job.s && net.rememberedRoute(job.s);
+            const order = [pref, 'node'].concat(routes).filter((r, i, a) => r && routes.includes(r) && a.indexOf(r) === i);
+            let info = null, last = null;
+            for (const rt of order) {
+                const r = await net.peek(rt, job.u, Object.assign({}, headers, playlist ? {} : { Range: 'bytes=0-2047' })).catch(e => ({ error: e.message }));
+                last = r;
+                if (r.text && /^#EXTM3U/.test(r.text.trim()) && r.status < 400) { route = rt; info = r; break; }
+                if (!r.error && isMedia(r)) { route = rt; info = r; break; }
+            }
+            if (!route) {
+                note({ start: new URL(job.u).host, tried: order.join('+'), status: last && (last.status || last.error) });
                 res.writeHead(502); return res.end('the video host refused every connection');
             }
-            route = r.ok.includes('node') ? 'node' : r.ok[0];
-            playlist = playlist || /mpegurl/i.test(r.info.type) || /^#EXTM3U/.test((r.info.head || '').trim());
-            if (!playlist) {
-                const free = overCap() || (r.ok.length > 1 && r.ok.length === r.all.length);
-                note({ file: new URL(job.u).host, works: r.ok.join('+'), via: free ? 'player direct' : 'server/' + route });
+            if (info.text) { playlist = true; text = info.text; finalUrl = info.url; }
+            else {
+                playlist = false;
+                // a whole file: free if the other connections can load it as well
+                const others = routes.filter(r => r !== route);
+                const okOthers = await Promise.all(others.map(rt => net.peek(rt, job.u, Object.assign({}, headers, { Range: 'bytes=0-2047' })).then(isMedia, () => false)));
+                const free = overCap() || (others.length > 0 && okOthers.every(Boolean));
+                note({ file: new URL(job.u).host, works: [route].concat(others.filter((r, i) => okOthers[i])).join('+'), via: free ? 'player direct' : 'server/' + route });
                 if (free) { res.writeHead(302, { Location: job.u, 'Access-Control-Allow-Origin': '*' }); return res.end(); }
             }
         }
         if (playlist) {
-            const p = await fetchText(route, job.u, headers);
+            const p = text ? { status: 200, url: finalUrl, text } : await fetchText(route, job.u, headers);
             if (p.status < 400 && /^#EXTM3U/.test(p.text.trim())) {
                 const body = await rewritePlaylist(p.text, p.url, base, job.h, route);
                 res.writeHead(200, { 'Content-Type': 'application/vnd.apple.mpegurl', 'Access-Control-Allow-Origin': '*', 'Cache-Control': 'no-cache' });

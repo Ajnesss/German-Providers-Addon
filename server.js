@@ -129,7 +129,8 @@ function toAddonStream(s, provider) {
     let url = s.url;
     // hosts like VOE only play on the connection that found the link: pass those through this server
     if (publicBase && passthrough.wanted(s, parts.join(' '), provider.id)) {
-        url = passthrough.proxyUrl(publicBase, s.url, headers);
+        const source = ((`${parts.join(' ')} ${s.title || ''}`).match(/\b([a-z0-9-]+\.(?:[a-z0-9-]+\.)*[a-z]{2,})\b/i) || [])[1];
+        url = passthrough.proxyUrl(publicBase, s.url, headers, null, source && source.toLowerCase());
     }
     const out = {
         name: `${flag} DE Providers\n${quality}`,

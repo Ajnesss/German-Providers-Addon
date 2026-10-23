@@ -12,7 +12,7 @@ const { Impit } = require('impit');
 const nativeFetch = globalThis.fetch.bind(globalThis);
 const WARP_PROXY = process.env.WARP_PROXY || 'socks5://127.0.0.1:40000';
 const PROXY_URL = (process.env.PROXY_URL || '').trim();
-const TIMEOUT = Number(process.env.NET_TIMEOUT_MS) || 20000;
+const TIMEOUT = Number(process.env.NET_TIMEOUT_MS) || 15000;
 const REMEMBER_MS = 30 * 60000;
 
 const { AsyncLocalStorage } = require('async_hooks');
@@ -61,7 +61,7 @@ function startWarpWatch() {
 const routes = browserLike => ['node'].concat(browserLike ? ['direct'] : [], warpUp ? ['warp'] : [], PROXY_URL ? ['proxy'] : []);
 
 // ---------- block detection ----------
-const BLOCK_STATUS = new Set([403, 429, 503, 520, 521, 522, 523, 524, 525, 526]);
+const BLOCK_STATUS = new Set([403, 429, 503]);
 const CHALLENGE = /Just a moment\.\.\.|cf-chl|_cf_chl_opt|challenge-platform|Attention Required! \| Cloudflare|DDoS-Guard|ddos-guard\/js|Checking your browser/i;
 // small pages that are only a captcha (s.to/AniWorld show one instead of redirecting after ~10 links per IP)
 const CAPTCHA = /captcha|turnstile|cf-turnstile|h-captcha|g-recaptcha/i;
@@ -191,17 +191,25 @@ async function peek(route, url, headers) {
     const timer = setTimeout(() => ac.abort(), 10000);
     try {
         const r = await open(route, url, headers, ac.signal);
-        let first = 0, head = '';
+        let first = 0, head = '', text = null;
+        const type = r.headers.get('content-type') || '';
         if (r.body) {
             const rd = r.body.getReader();
             const { value } = await rd.read();
             if (value) { first = value.length; head = Buffer.from(value.subarray(0, 200)).toString('utf8'); }
+            if (value && (/mpegurl/i.test(type) || /^#EXTM3U/.test(head.trim()))) {
+                // a playlist: keep reading it (they are small), links in it may be single-use
+                const parts = [Buffer.from(value)];
+                let size = value.length;
+                for (;;) { const c = await rd.read(); if (c.done) break; parts.push(Buffer.from(c.value)); size += c.value.length; if (size > 5e6) break; }
+                text = Buffer.concat(parts).toString('utf8');
+            }
             rd.cancel().catch(() => {});
         }
-        return { status: r.status, type: r.headers.get('content-type') || '', first, head, url: r.url || url };
+        return { status: r.status, type, first, head, text, url: r.url || url };
     } finally { clearTimeout(timer); ac.abort(); }
 }
 
 const availableRoutes = () => ['node'].concat(warpUp ? ['warp'] : [], PROXY_URL ? ['proxy'] : []);
 
-module.exports = { open, availableRoutes, peek, probe: (route, url, opts) => once(route, url, opts || {}, true), warpOn: () => warpUp, traceStore, smartFetch, nativeFetch, startWarpWatch, checkWarp, diag, status: () => ({ warp: warpUp, proxy: !!PROXY_URL, remembered: Object.fromEntries([...memory].map(([h, m]) => [h, m.route])), stats }) };
+module.exports = { rememberedRoute: host => { const m = memory.get(host); return m && m.until > Date.now() ? m.route : null; }, open, availableRoutes, peek, probe: (route, url, opts) => once(route, url, opts || {}, true), warpOn: () => warpUp, traceStore, smartFetch, nativeFetch, startWarpWatch, checkWarp, diag, status: () => ({ warp: warpUp, proxy: !!PROXY_URL, remembered: Object.fromEntries([...memory].map(([h, m]) => [h, m.route])), stats }) };
