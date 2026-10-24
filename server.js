@@ -43,6 +43,19 @@ const log = (...a) => console.log(new Date().toISOString(), ...a);
 let providers = [];   // [{ id, name, types, mod, lock }]
 let pluginVersion = '?';
 
+// The plugins skip DoodStream on purpose (it answers plain requests with a Cloudflare check). This addon's
+// connection layer gets past such checks, so the skip list is switched off while loading (ALLOW_DOOD=0 keeps it).
+const Module = require('module');
+function loadPlugin(file) {
+    let code = fs.readFileSync(file, 'utf8');
+    if (process.env.ALLOW_DOOD !== '0') code = code.replace(/var BLOCKED = \[[^\]]*\];/, 'var BLOCKED = [];');
+    const m = new Module(file, module);
+    m.filename = file;
+    m.paths = Module._nodeModulePaths(path.dirname(file));
+    m._compile(code, file);
+    return m.exports;
+}
+
 function loadFrom(dir) {
     const manifest = JSON.parse(fs.readFileSync(path.join(dir, 'manifest.json'), 'utf8'));
     const list = [];
@@ -51,8 +64,7 @@ function loadFrom(dir) {
         if (SKIP.includes(s.id)) continue;
         const file = path.resolve(dir, s.filename.replace(/^providers\//, ''));
         try {
-            delete require.cache[require.resolve(file)];
-            const mod = require(file);
+            const mod = loadPlugin(file);
             if (typeof mod.getStreams !== 'function') throw new Error('no getStreams');
             list.push({ id: s.id, name: s.name, types: s.supportedTypes || [], mod, lock: Promise.resolve() });
         } catch (e) {
