@@ -48,7 +48,11 @@ let pluginVersion = '?';
 const Module = require('module');
 function loadPlugin(file) {
     let code = fs.readFileSync(file, 'utf8');
-    if (process.env.ALLOW_DOOD !== '0') code = code.replace(/var BLOCKED = \[[^\]]*\];/, 'var BLOCKED = [];');
+    if (process.env.ALLOW_DOOD !== '0') {
+        code = code.replace(/var BLOCKED = \[[^\]]*\];/, 'var BLOCKED = [];');
+        // send Dood links to the plugin's own Dood extractor (player page /e/ with the video link), not the generic sniffer
+        if (/^function dood\(/m.test(code)) code = code.replace(/^var HOSTS = \[/m, 'var HOSTS = [\n  [dood, ["dood", "d000d.com", "d0000d.com", "ds2play.com", "doodstream.com", "dooodster.com", "vide0.net", "dsvplay.com", "do7go.com", "playmogo.com", "doods.pro"]],');
+    }
     const m = new Module(file, module);
     m.filename = file;
     m.paths = Module._nodeModulePaths(path.dirname(file));

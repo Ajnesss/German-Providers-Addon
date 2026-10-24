@@ -153,9 +153,28 @@ async function smartFetch(input, opts = {}) {
             if (isTimeout(e) && !sawBlock) break;
         }
     }
+    // a host that blocks every route: hosts like DoodStream run mirror domains with the same files, try those
+    if (sawBlock && !opts._mirror) {
+        const mirrors = mirrorsFor(host);
+        for (const m of mirrors) {
+            const alt = url.replace(/^(https?:\/\/)[^/]+/i, `$1${m}`);
+            try {
+                const r = await smartFetch(alt, Object.assign({}, opts, { _mirror: true }));
+                if (r.status !== 403 && r.status !== 429 && r.status !== 503 && !r.headers.get('x-still-blocked')) return r;
+            } catch (e) { /* next mirror */ }
+        }
+    }
     if (candidate) return toResponse(candidate);
-    if (last) return toResponse(last);
+    if (last) { const out = toResponse(last); if (sawBlock && opts._mirror) out.headers.set('x-still-blocked', '1'); return out; }
     throw lastErr || new Error(`fetch failed for ${url}`);
+}
+
+// mirror domains that serve the same files (DoodStream family)
+const DOOD_RE = /(^|\.)(dood|d000d|d0000d|ds2play|doodstream|dooodster|vide0|dsvplay|do7go|playmogo|doods)\./i;
+const DOOD_MIRRORS = (process.env.DOOD_MIRRORS || 'dood.yt,d000d.com,dood.li,doodstream.com,ds2play.com,dood.wf').split(',').map(x => x.trim()).filter(Boolean);
+function mirrorsFor(host) {
+    if (DOOD_RE.test(host)) return DOOD_MIRRORS.filter(m => m !== host);
+    return [];
 }
 
 // ---------- diagnostics: /diag ----------
