@@ -256,6 +256,10 @@ async function peek(route, url, headers) {
     } finally { clearTimeout(timer); ac.abort(); }
 }
 
-const availableRoutes = () => ['node'].concat(warpUp ? ['warp'] : [], PROXY_URL ? ['proxy'] : []);
+// playback connections: plain node, Chrome-like ('direct', same IP as node: some CDNs refuse node's TLS), WARP, proxy
+const availableRoutes = () => ['node', 'direct'].concat(warpUp ? ['warp'] : [], PROXY_URL ? ['proxy'] : []);
+// which outgoing IP a route uses (node and direct share the server's own IP)
+const ipOf = route => (route === 'node' || route === 'direct') ? 'server' : route;
+function warpLog() { try { return require('fs').readFileSync('/tmp/warp.log', 'utf8').split('\n').filter(Boolean).slice(-25); } catch (e) { return ['no warp log']; } }
 
-module.exports = { hasCookie: url => !!cookieHeader(url), rememberedRoute: host => { const m = memory.get(host); return m && m.until > Date.now() ? m.route : null; }, open, availableRoutes, peek, probe: (route, url, opts) => once(route, url, opts || {}, true), warpOn: () => warpUp, traceStore, smartFetch, nativeFetch, startWarpWatch, checkWarp, diag, status: () => ({ warp: warpUp, proxy: !!PROXY_URL, remembered: Object.fromEntries([...memory].map(([h, m]) => [h, m.route])), stats }) };
+module.exports = { hasCookie: url => !!cookieHeader(url), rememberedRoute: host => { const m = memory.get(host); return m && m.until > Date.now() ? m.route : null; }, open, availableRoutes, peek, probe: (route, url, opts) => once(route, url, opts || {}, true), warpOn: () => warpUp, traceStore, smartFetch, nativeFetch, startWarpWatch, checkWarp, diag, ipOf, status: () => ({ warp: warpUp, warpLog: warpLog(), proxy: !!PROXY_URL, remembered: Object.fromEntries([...memory].map(([h, m]) => [h, m.route])), stats }) };

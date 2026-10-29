@@ -268,7 +268,7 @@ function getStreams(type, id, prefetched) {
 // ---------- debug jobs (run providers one by one and record every request they make) ----------
 const jobs = new Map();
 async function runDebugJob(job, only) {
-    const [ref, s, e] = job.id.split(':');
+    const [ref, s, e] = job.id.split(':').filter(x => x !== 'tmdb');
     const pType = job.type === 'movie' ? 'movie' : 'tv';
     const tmdbId = /^tt\d+$/.test(ref) ? await toTmdb(ref, pType) : ref;
     job.tmdbId = tmdbId;

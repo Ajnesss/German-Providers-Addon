@@ -37,6 +37,11 @@ async function reach(url, headers) {
     const first = (ok[0] || res.find(x => x.r) || {}).r || null;
     return { ok: ok.map(x => x.rt), all: routes, info: first };
 }
+// a link is free of IP locks only if it loads from at least two different IPs, and from every IP we have
+function ipFree(okRoutes, allRoutes) {
+    const ok = new Set(okRoutes.map(net.ipOf)), all = new Set(allRoutes.map(net.ipOf));
+    return ok.size > 1 && ok.size === all.size;
+}
 const decisions = [];   // last decisions, for /net
 function note(d) { decisions.unshift(Object.assign({ at: new Date().toISOString().slice(11, 19) }, d)); decisions.length = Math.min(decisions.length, 60); }
 
@@ -74,7 +79,7 @@ async function rewritePlaylist(text, baseUrl, base, headers, route) {
         if (first) {
             const seg = await reach(abs(first.trim()), headers);
             // pieces go straight to the player only if every connection can load them and no session cookie is involved
-            direct = overCap() || (seg.ok.length > 1 && seg.ok.length === seg.all.length && !net.hasCookie(abs(first.trim())));
+            direct = overCap() || (ipFree(seg.ok, seg.all) && !net.hasCookie(abs(first.trim())));
             if (!direct && seg.ok.length) segRoute = seg.ok.includes(route) ? route : seg.ok[0];
             note({ pieces: new URL(abs(first.trim())).host, works: seg.ok.join('+') || 'none', via: direct ? 'player direct' : 'server/' + segRoute });
         }
@@ -153,7 +158,7 @@ async function handle(req, res, base) {
                 // a whole file: free if the other connections can load it as well
                 const others = routes.filter(r => r !== route);
                 const okOthers = await Promise.all(others.map(rt => net.peek(rt, job.u, Object.assign({}, headers, { Range: 'bytes=0-2047' })).then(isMedia, () => false)));
-                const free = overCap() || (others.length > 0 && okOthers.every(Boolean));
+                const free = overCap() || ipFree([route].concat(others.filter((r, i) => okOthers[i])), routes);
                 note({ file: new URL(job.u).host, works: [route].concat(others.filter((r, i) => okOthers[i])).join('+'), via: free ? 'player direct' : 'server/' + route });
                 if (free) { res.writeHead(302, { Location: job.u, 'Access-Control-Allow-Origin': '*' }); return res.end(); }
             }

@@ -25,7 +25,7 @@ if [ "${WARP:-1}" != "0" ] && command -v wgcf >/dev/null 2>&1 && command -v wire
       sleep "$wait"
       [ "$wait" -lt 600 ] && wait=$((wait * 2))
     done
-  ) 2>&1 | sed -u 's/^/[warp] /' &
+  ) 2>&1 | sed -u 's/^/[warp] /' | tee -a /tmp/warp.log &
 else
   echo "[warp] not started (WARP=0 or tools missing)"
 fi
