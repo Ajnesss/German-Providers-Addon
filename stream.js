@@ -37,10 +37,12 @@ async function reach(url, headers) {
     const first = (ok[0] || res.find(x => x.r) || {}).r || null;
     return { ok: ok.map(x => x.rt), all: routes, info: first };
 }
-// a link is free of IP locks only if it loads from at least two different IPs, and from every IP we have
+// a link may go straight to the player only if it isn't tied to an IP (loads from at least two different IPs, and
+// from every IP we have) AND a plain connection loads it: the TV's player isn't browser-like, so a host that only
+// accepts browser-like connections must stay on the server even when it accepts them from every IP
 function ipFree(okRoutes, allRoutes) {
     const ok = new Set(okRoutes.map(net.ipOf)), all = new Set(allRoutes.map(net.ipOf));
-    return ok.size > 1 && ok.size === all.size;
+    return okRoutes.includes('node') && ok.size > 1 && ok.size === all.size;
 }
 const decisions = [];   // last decisions, for /net
 function note(d) { decisions.unshift(Object.assign({ at: new Date().toISOString().slice(11, 19) }, d)); decisions.length = Math.min(decisions.length, 60); }
