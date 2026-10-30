@@ -134,7 +134,7 @@ async function toTmdb(imdbId, type) {
 const LANG_KEY = lang => (lang === 'Deutsch' ? 'de' : /dt\. UT|OmU/.test(lang) ? 'de-sub' : 'other');
 const RANK = { de: 0, 'de-sub': 1, other: 2 };
 
-function toAddonStream(s, provider) {
+function toAddonStream(s, provider, ctx) {
     // s.name looks like "Serienstream · Deutsch · voe.sx" (built by the plugin)
     const parts = (s.name || provider.name).split(' · ');
     const lang = parts[1] || 'Deutsch';
@@ -146,7 +146,9 @@ function toAddonStream(s, provider) {
     // hosts like VOE only play on the connection that found the link: pass those through this server
     if (publicBase && passthrough.wanted(s, parts.join(' '), provider.id)) {
         const source = ((`${parts.join(' ')} ${s.title || ''}`).match(/\b([a-z0-9-]+\.(?:[a-z0-9-]+\.)*[a-z]{2,})\b/i) || [])[1];
-        url = passthrough.proxyUrl(publicBase, s.url, headers, null, source && source.toLowerCase());
+        const host = (parts[2] || source || '').toLowerCase();
+        const re = ctx ? [ctx.type, ctx.id, provider.id, host] : null;
+        url = passthrough.proxyUrl(publicBase, s.url, headers, null, source && source.toLowerCase(), re);
     }
     const out = {
         name: `${flag} DE Providers\n${quality}`,
@@ -204,6 +206,7 @@ async function resolveAnimeId(id) {
 const knownProviders = new Map();
 const KNOWN_GRACE_MS = Number(process.env.KNOWN_GRACE_MS) || 1500;
 async function lookup(type, id) {
+    const ctx = { type, id };
     let tmdbId, pType, season, episode;
     if (ANIME_PREFIXES.includes(id.split(':')[0])) {
         const a = await resolveAnimeId(id).catch(e => { log(`  anime id ${id}: ${e.message}`); return null; });
@@ -226,7 +229,7 @@ async function lookup(type, id) {
     const started = Date.now();
     const runs = active.map((p, order) => runProvider(p, tmdbId, pType, season, episode)
         .then(list => {
-            (list || []).forEach((st, i) => results.push(Object.assign(toAddonStream(st, p), { order, i, pref: prefIndex(p.id), provider: p.id })));
+            (list || []).forEach((st, i) => results.push(Object.assign(toAddonStream(st, p, ctx), { order, i, pref: prefIndex(p.id), provider: p.id })));
             log(`  ${p.id}: ${(list || []).length} streams in ${Date.now() - started} ms`);
         })
         .catch(err => log(`  ${p.id}: error ${err.message}`)));
@@ -269,6 +272,24 @@ const prefIndex = id => { const i = PREFERRED.indexOf(id); return i < 0 ? PREFER
 const DEMOTE = new RegExp(process.env.DEMOTE_HOSTS || 'supervideo|dropload|dr0pstream', 'i');
 const demoted = x => (DEMOTE.test(`${x.stream.title} ${x.stream.name}`) ? 1 : 0);
 const sortStreams = list => list.slice().sort((a, b) => demoted(a) - demoted(b) || a.rank - b.rank || a.pref - b.pref || a.order - b.order || a.i - b.i).map(x => x.stream);
+
+// an expired link from the player's cache: search that episode again and send the player to the same provider's
+// new link for the same host (or another link of that provider). One search per episode at a time.
+const refreshing = new Map();
+passthrough.setRefresher(async ([type, id, prov, host]) => {
+    const key = `${type}:${id}`;
+    if (!refreshing.has(key)) {
+        log(`refreshing expired link: ${key} (${prov} ${host})`);
+        cache.delete(key);
+        const p = getStreams(type, id).finally(() => setTimeout(() => refreshing.delete(key), 60000));
+        refreshing.set(key, p);
+    }
+    const streams = await refreshing.get(key);
+    const mine = streams.filter(st => (st.behaviorHints || {}).bingeGroup && st.behaviorHints.bingeGroup.startsWith(`german-providers-${prov}-`));
+    const job = st => passthrough.jobOf(st.url) || {};
+    const pick = mine.find(st => (job(st).re || [])[3] === host) || mine.find(st => passthrough.jobOf(st.url));
+    return pick ? passthrough.markFresh(pick.url) : null;
+});
 
 function getStreams(type, id, prefetched) {
     const key = `${type}:${id}`;

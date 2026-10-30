@@ -60,8 +60,10 @@ function wanted(stream, label, providerId) {
     return !DIRECT_PROVIDERS.includes(String(providerId || '').toLowerCase());
 }
 
-function proxyUrl(base, url, headers, route, source) {
+function proxyUrl(base, url, headers, route, source, re, fresh) {
     const job = { u: url, h: headers || {} };
+    if (re) job.re = re;            // [type, id, provider, host]: lets an expired link be looked up again
+    if (fresh) job.f = 1;           // already a refreshed link: don't refresh again
     if (route) job.r = route;
     if (source) job.s = source;     // the host whose page produced this link (e.g. supervideo.cc)
     const data = b64(JSON.stringify(job));
@@ -95,6 +97,19 @@ async function rewritePlaylist(text, baseUrl, base, headers, route) {
         if (media) usage.segmentsProxied++;
         return proxyUrl(base, abs(t), headers, media ? segRoute : route);
     }).join('\n');
+}
+
+// links from the player's cache (Nuvio keeps them for days) expire at the host after a few hours. When the first
+// request of such a link fails, the server looks the episode up again and sends the player to the fresh link.
+let refresher = null;
+async function tryRefresh(job, res) {
+    if (!refresher || !job.re || job.f) return false;
+    const fresh = await refresher(job.re).catch(() => null);
+    note({ refresh: job.re.slice(0, 4).join(' '), result: fresh ? 'new link' : 'none found' });
+    if (!fresh) return false;
+    res.writeHead(302, { Location: fresh, 'Access-Control-Allow-Origin': '*', 'Cache-Control': 'no-cache' });
+    res.end();
+    return true;
 }
 
 const PASS = ['content-type', 'content-length', 'content-range', 'accept-ranges', 'last-modified', 'etag'];
@@ -152,6 +167,7 @@ async function handle(req, res, base) {
             }
             if (!route) {
                 note({ start: new URL(job.u).host, tried: tried.join(' | ') });
+                if (await tryRefresh(job, res)) return;
                 res.writeHead(502); return res.end('refused: ' + tried.join(' | '));
             }
             if (info.text) { playlist = true; text = info.text; finalUrl = info.url; }
@@ -172,6 +188,7 @@ async function handle(req, res, base) {
                 res.writeHead(200, { 'Content-Type': 'application/vnd.apple.mpegurl', 'Access-Control-Allow-Origin': '*', 'Cache-Control': 'no-cache' });
                 return res.end(body);
             }
+            if (!job.r && await tryRefresh(job, res)) return;
             res.writeHead(p.status >= 400 ? p.status : 502); return res.end('not a playlist');
         }
         if (overCap()) { res.writeHead(302, { Location: job.u }); return res.end(); }
@@ -184,4 +201,17 @@ async function handle(req, res, base) {
     }
 }
 
-module.exports = { usage: () => Object.assign({}, usage, { capGB: CAP_BYTES / 1024 ** 3, usedMB: Math.round(usage.bytes / 1048576), decisions }), wanted, proxyUrl, handle, rewritePlaylist, mode: MODE, hosts: HOSTS };
+// read / re-sign a /p/ link
+function jobOf(link) {
+    const m = String(link || '').match(/\/p\/([\w-]+)\/([\w-]+)\//);
+    if (!m || sign(m[2]) !== m[1]) return null;
+    try { return JSON.parse(unb64(m[2])); } catch (e) { return null; }
+}
+function markFresh(link) {
+    const job = jobOf(link);
+    if (!job) return link;
+    const base = link.slice(0, link.indexOf('/p/'));
+    return proxyUrl(base, job.u, job.h, job.r, job.s, job.re, true);
+}
+
+module.exports = { jobOf, markFresh, setRefresher: fn => { refresher = fn; }, usage: () => Object.assign({}, usage, { capGB: CAP_BYTES / 1024 ** 3, usedMB: Math.round(usage.bytes / 1048576), decisions }), wanted, proxyUrl, handle, rewritePlaylist, mode: MODE, hosts: HOSTS };
