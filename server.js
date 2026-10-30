@@ -200,6 +200,9 @@ async function resolveAnimeId(id) {
     return { tmdbId, pType, season, episode };
 }
 
+// which providers had streams for a show last time (any episode): tmdb show -> Set of provider ids
+const knownProviders = new Map();
+const KNOWN_GRACE_MS = Number(process.env.KNOWN_GRACE_MS) || 1500;
 async function lookup(type, id) {
     let tmdbId, pType, season, episode;
     if (ANIME_PREFIXES.includes(id.split(':')[0])) {
@@ -223,16 +226,33 @@ async function lookup(type, id) {
     const started = Date.now();
     const runs = active.map((p, order) => runProvider(p, tmdbId, pType, season, episode)
         .then(list => {
-            (list || []).forEach((st, i) => results.push(Object.assign(toAddonStream(st, p), { order, i, pref: prefIndex(p.id) })));
+            (list || []).forEach((st, i) => results.push(Object.assign(toAddonStream(st, p), { order, i, pref: prefIndex(p.id), provider: p.id })));
             log(`  ${p.id}: ${(list || []).length} streams in ${Date.now() - started} ms`);
         })
         .catch(err => log(`  ${p.id}: error ${err.message}`)));
 
-    // answer when every provider is done, or at the time limit with whatever arrived so far
-    let timedOut = false;
-    await Promise.race([Promise.all(runs), new Promise(r => setTimeout(() => { timedOut = true; r(); }, TIMEOUT_MS))]);
+    let finished = 0;
+    runs.forEach(r => r.then(() => { finished++; }));
+    // answer when every provider is done, or at the time limit with whatever arrived so far. If we know which
+    // providers had this show before, answer as soon as those are done (plus a short grace), so the player's
+    // "same provider as last time" match isn't lost to a slow site that never has the show anyway.
+    const showKey = `${pType}:${tmdbId}`;
+    const had = knownProviders.get(showKey);
+    const hadRuns = had ? active.map((p, i) => had.has(p.id) ? runs[i] : null).filter(Boolean) : [];
+    let early = false;
+    const waits = [Promise.all(runs), new Promise(r => setTimeout(r, TIMEOUT_MS))];
+    if (hadRuns.length) waits.push(Promise.all(hadRuns).then(() => new Promise(r => setTimeout(r, KNOWN_GRACE_MS)))) ;
+    await Promise.race(waits);
+    const allDone = finished === runs.length;
+    early = !allDone;
     const snapshot = results.slice();
-    if (timedOut) {
+    const remember = () => {
+        const ids = new Set([...(knownProviders.get(showKey) || [])].concat(results.map(x => x.provider).filter(Boolean)));
+        if (ids.size) { knownProviders.delete(showKey); knownProviders.set(showKey, ids); if (knownProviders.size > 2000) knownProviders.delete(knownProviders.keys().next().value); }
+    };
+    if (allDone) remember(); else Promise.all(runs).then(remember);
+    if (early) log(`  answered after ${Date.now() - started} ms${hadRuns.length ? ' (known providers for this show done)' : ''}`);
+    if (early) {
         // late providers still finish in the background; refresh the cache with the full list for the next request
         Promise.all(runs).then(() => {
             const key = `${type}:${id}`;
