@@ -16,7 +16,13 @@ const path = require('path');
 
 // ---------- settings (environment variables) ----------
 const PORT = Number(process.env.PORT) || 7000;
-const TMDB_API_KEY = (process.env.TMDB_API_KEY || '').trim();
+let TMDB_API_KEY = (process.env.TMDB_API_KEY || '').trim();
+// a copy on another server (e.g. Oracle) can get the key from the main one (Render) with the relay password
+const KEY_SOURCE = (process.env.KEY_SOURCE || 'https://german-providers-addon.onrender.com').replace(/\/$/, '');
+const KEY_FILE = process.env.KEY_FILE || require('path').join(__dirname, '.tmdb-key');
+let keyStatus = TMDB_API_KEY ? 'from settings' : 'missing';
+function setKey(k, how) { TMDB_API_KEY = k; globalThis.TMDB_API_KEY = k; keyStatus = how; try { require('fs').writeFileSync(KEY_FILE, k); } catch (e) {} }
+if (!TMDB_API_KEY) { try { const k = require('fs').readFileSync(KEY_FILE, 'utf8').trim(); if (k) { TMDB_API_KEY = k; keyStatus = 'saved earlier'; } } catch (e) {} }
 const TIMEOUT_MS = Number(process.env.TIMEOUT_MS) || 15000;       // how long the addon waits before answering
 const CACHE_MIN = Number(process.env.CACHE_MINUTES) || 10;        // reuse results (stream links expire, keep short)
 const ONLY = (process.env.PROVIDERS || '').split(',').map(s => s.trim()).filter(Boolean);   // e.g. "serienstream,aniworld,ard"
@@ -432,7 +438,7 @@ const server = http.createServer(async (req, res) => {
     const url = decodeURIComponent((req.url || '/').split('?')[0]);
     if (req.method === 'OPTIONS') return send(res, 204, {});
     if (url === '/' || url === '/health') {
-        return send(res, 200, { ok: true, homeRelay: relayAlive() ? 'online' : 'offline', addon: `${req.headers['x-forwarded-proto'] || 'http'}://${req.headers.host}/manifest.json`, plugins: pluginVersion, providers: providers.map(p => p.id), tmdbKey: !!TMDB_API_KEY });
+        return send(res, 200, { ok: true, homeRelay: relayAlive() ? 'online' : 'offline', addon: `${req.headers['x-forwarded-proto'] || 'http'}://${req.headers.host}/manifest.json`, plugins: pluginVersion, providers: providers.map(p => p.id), tmdbKey: !!TMDB_API_KEY, tmdbKeyStatus: keyStatus });
     }
     if (url === '/manifest.json') return send(res, 200, addonManifest(), 3600);
     if (url === '/diag' || url.startsWith('/diag/')) return send(res, 200, await net.diag());
@@ -497,6 +503,17 @@ const server = http.createServer(async (req, res) => {
 
     // ---- home relay ----
     const q = new URL(req.url || '/', 'http://x').searchParams;
+    // set the TMDB key from a browser: /setkey?token=<RELAY_TOKEN>&key=<TMDB key>
+    if (url === '/setkey') {
+        const q = new URL(req.url, 'http://x').searchParams;
+        if (!RELAY_TOKEN || q.get('token') !== RELAY_TOKEN) return send(res, 403, { error: 'wrong token' });
+        const k = (q.get('key') || '').trim();
+        const ok = k && (await fetch(`https://api.themoviedb.org/3/configuration?api_key=${encodeURIComponent(k)}`).then(r => r.ok, () => false));
+        if (!ok) return send(res, 400, { error: 'TMDB did not accept that key' });
+        setKey(k, 'set by link');
+        log('TMDB key set by link');
+        return send(res, 200, { ok: true, tmdbKey: true });
+    }
     if (url === '/relay/register' || url === '/relay/config') {
         if (!RELAY_TOKEN || q.get('token') !== RELAY_TOKEN) return send(res, 403, { error: 'wrong token' });
         if (url === '/relay/config') return send(res, 200, { tmdbKey: TMDB_API_KEY });
@@ -561,7 +578,21 @@ const server = http.createServer(async (req, res) => {
 
 if (require.main === module) {
     loadFrom(BUNDLED_DIR);
-    if (!TMDB_API_KEY) log('WARNING: TMDB_API_KEY is not set, every lookup will return nothing');
+    if (!TMDB_API_KEY) {
+        log('WARNING: TMDB_API_KEY is not set' + (RELAY_TOKEN ? `, asking ${KEY_SOURCE} for it` : ', every lookup will return nothing'));
+        if (RELAY_TOKEN) (async () => {
+            for (let i = 0; !TMDB_API_KEY; i++) {
+                try {
+                    const r = await fetch(`${KEY_SOURCE}/relay/config?token=${encodeURIComponent(RELAY_TOKEN)}`, { signal: AbortSignal.timeout(90000) });
+                    const d = await r.json().catch(() => ({}));
+                    if (d.tmdbKey) { setKey(d.tmdbKey, 'from ' + KEY_SOURCE); log('TMDB key received from ' + KEY_SOURCE); break; }
+                    keyStatus = `missing (${KEY_SOURCE} answered ${r.status}${d.error ? ' ' + d.error : ''})`;
+                } catch (e) { keyStatus = `missing (${KEY_SOURCE}: ${e.message})`; }
+                log('  ' + keyStatus);
+                await new Promise(r => setTimeout(r, Math.min(600000, 30000 * (i + 1))));
+            }
+        })();
+    }
     server.listen(PORT, () => log(`German Providers addon on http://localhost:${PORT}/manifest.json`));
     net.startWarpWatch();
     if (AUTO_UPDATE) { update(); setInterval(update, UPDATE_HOURS * 3600000).unref(); }
