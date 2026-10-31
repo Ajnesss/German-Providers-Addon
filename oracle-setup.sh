@@ -1,0 +1,74 @@
+#!/bin/bash
+# German Providers Addon on Oracle Cloud (Always Free).
+# Paste this whole file into "Cloud-init script" when creating the server: it installs everything on first boot.
+# Progress log on the server: /var/log/gpa-setup.log
+exec > /var/log/gpa-setup.log 2>&1
+set -x
+
+REPO=https://github.com/Ajnesss/German-Providers-Addon
+RENDER=https://german-providers-addon.onrender.com
+RELAY_TOKEN=fidio624e1a0e          # same as RELAY_TOKEN on Render: used once to fetch the TMDB key from there
+
+# 1. Oracle's Ubuntu image blocks every port except SSH: open web ports 80 + 443
+iptables -I INPUT 1 -p tcp --dport 80 -j ACCEPT
+iptables -I INPUT 1 -p tcp --dport 443 -j ACCEPT
+DEBIAN_FRONTEND=noninteractive apt-get update
+DEBIAN_FRONTEND=noninteractive apt-get install -y docker.io git curl iptables-persistent
+netfilter-persistent save
+systemctl enable --now docker
+
+# 2. the addon's code
+git clone --depth 1 "$REPO" /opt/gpa
+
+# 3. settings: TMDB key from Render, public address = this server's IP as an sslip.io name (free, gets https)
+KEY=""
+for i in $(seq 1 20); do
+  KEY=$(curl -fsS -m 80 "$RENDER/relay/config?token=$RELAY_TOKEN" | sed -n 's/.*"tmdbKey":"\([^"]*\)".*/\1/p')
+  [ -n "$KEY" ] && break; sleep 15
+done
+IP=$(curl -fsS -m 20 https://api.ipify.org || curl -fsS -m 20 https://ifconfig.me)
+HOST="$(echo "$IP" | tr . -).sslip.io"
+cat > /opt/gpa.env <<ENV
+TMDB_API_KEY=$KEY
+RELAY_TOKEN=$RELAY_TOKEN
+TIMEOUT_MS=25000
+PASSTHROUGH_GB=9000
+PUBLIC_URL=https://$HOST
+ENV
+echo "https://$HOST/manifest.json" > /opt/gpa-address.txt
+
+# 4. build and start the addon (restarts by itself after crashes and reboots)
+cat > /usr/local/bin/gpa-deploy <<'DEPLOY'
+#!/bin/bash
+# rebuilds the addon from GitHub when there is a new commit (or with "force")
+cd /opt/gpa || exit 1
+OLD=$(git rev-parse HEAD)
+git fetch -q --depth 1 origin && git reset -q --hard origin/HEAD
+NEW=$(git rev-parse HEAD)
+if [ "$OLD" != "$NEW" ] || [ "$1" = "force" ] || ! docker ps --format '{{.Names}}' | grep -qx addon; then
+  echo "$(date) deploying $NEW"
+  docker build -t gpa /opt/gpa && {
+    docker rm -f addon 2>/dev/null
+    docker run -d --name addon --restart always --env-file /opt/gpa.env -p 127.0.0.1:8000:8000 gpa
+    docker image prune -f >/dev/null
+  }
+fi
+DEPLOY
+chmod +x /usr/local/bin/gpa-deploy
+/usr/local/bin/gpa-deploy force
+
+# 5. https in front of it (Caddy gets a free certificate for the sslip.io name)
+mkdir -p /opt/caddy
+cat > /opt/caddy/Caddyfile <<CADDY
+$HOST {
+    reverse_proxy 127.0.0.1:8000
+}
+CADDY
+docker rm -f caddy 2>/dev/null
+docker run -d --name caddy --restart always --network host \
+  -v /opt/caddy/Caddyfile:/etc/caddy/Caddyfile -v caddy_data:/data caddy:2
+
+# 6. updates: every 15 minutes, pick up new commits from GitHub (no Render-style "Manual Deploy" needed)
+echo '*/15 * * * * root /usr/local/bin/gpa-deploy >> /var/log/gpa-deploy.log 2>&1' > /etc/cron.d/gpa-deploy
+
+echo "DONE. Addon address: https://$HOST/manifest.json"
