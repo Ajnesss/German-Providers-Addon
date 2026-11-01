@@ -60,8 +60,9 @@ function wanted(stream, label, providerId) {
     return !DIRECT_PROVIDERS.includes(String(providerId || '').toLowerCase());
 }
 
-function proxyUrl(base, url, headers, route, source, re, fresh) {
+function proxyUrl(base, url, headers, route, source, re, fresh, force) {
     const job = { u: url, h: headers || {} };
+    if (force) job.fp = 1;          // always through this server (e.g. German broadcasters that only play inside Germany)
     if (re) job.re = re;            // [type, id, provider, host]: lets an expired link be looked up again
     if (fresh) job.f = 1;           // already a refreshed link: don't refresh again
     if (route) job.r = route;
@@ -73,7 +74,7 @@ function proxyUrl(base, url, headers, route, source, re, fresh) {
 
 const isPlaylist = (url, type, head) => /mpegurl/i.test(type || '') || /\.m3u8(\?|$)/i.test(url) || /^#EXTM3U/.test(head || '');
 
-async function rewritePlaylist(text, baseUrl, base, headers, route) {
+async function rewritePlaylist(text, baseUrl, base, headers, route, force) {
     const abs = u => new URL(u, baseUrl).toString();
     const lines = text.split(/\r?\n/);
     const media = /#EXTINF/.test(text);     // a playlist of video pieces (not a list of qualities)
@@ -83,7 +84,7 @@ async function rewritePlaylist(text, baseUrl, base, headers, route) {
         if (first) {
             const seg = await reach(abs(first.trim()), headers);
             // pieces go straight to the player only if every connection can load them and no session cookie is involved
-            direct = overCap() || (ipFree(seg.ok, seg.all) && !net.hasCookie(abs(first.trim())));
+            direct = !force && (overCap() || (ipFree(seg.ok, seg.all) && !net.hasCookie(abs(first.trim()))));
             if (!direct && seg.ok.length) segRoute = seg.ok.includes(route) ? route : seg.ok[0];
             note({ pieces: new URL(abs(first.trim())).host, works: seg.ok.join('+') || 'none', via: direct ? 'player direct' : 'server/' + segRoute });
         }
@@ -92,19 +93,19 @@ async function rewritePlaylist(text, baseUrl, base, headers, route) {
     return lines.map(line => {
         const t = line.trim();
         if (!t) return line;
-        if (t.startsWith('#')) return line.replace(/URI="([^"]+)"/g, (m, u) => `URI="${proxyUrl(base, abs(u), headers, route)}"`);
+        if (t.startsWith('#')) return line.replace(/URI="([^"]+)"/g, (m, u) => `URI="${proxyUrl(base, abs(u), headers, route, null, null, false, force)}"`);
         if (media && direct) { usage.segmentsDirect++; return abs(t); }
         if (media) usage.segmentsProxied++;
-        return proxyUrl(base, abs(t), headers, media ? segRoute : route);
+        return proxyUrl(base, abs(t), headers, media ? segRoute : route, null, null, false, force);
     }).join('\n');
 }
 
-// links from the player's cache (Nuvio keeps them for days) expire at the host after a few hours. When the first
-// request of such a link fails, the server looks the episode up again and sends the player to the fresh link.
+// When the first request of a link fails (expired after hours in the player's cache, or the video was deleted), the
+// server looks the episode up again and sends the player to a working link, from the same site where possible.
 let refresher = null;
 async function tryRefresh(job, res) {
     if (!refresher || !job.re || job.f) return false;
-    const fresh = await refresher(job.re).catch(() => null);
+    const fresh = await refresher(job.re, job.u).catch(() => null);
     note({ refresh: job.re.slice(0, 4).join(' '), result: fresh ? 'new link' : 'none found' });
     if (!fresh) return false;
     res.writeHead(302, { Location: fresh, 'Access-Control-Allow-Origin': '*', 'Cache-Control': 'no-cache' });
@@ -176,7 +177,7 @@ async function handle(req, res, base) {
                 // a whole file: free if the other connections can load it as well
                 const others = routes.filter(r => r !== route);
                 const okOthers = await Promise.all(others.map(rt => net.peek(rt, job.u, Object.assign({}, headers, { Range: 'bytes=0-2047' })).then(isMedia, () => false)));
-                const free = overCap() || ipFree([route].concat(others.filter((r, i) => okOthers[i])), routes);
+                const free = !job.fp && (overCap() || ipFree([route].concat(others.filter((r, i) => okOthers[i])), routes));
                 note({ file: new URL(job.u).host, works: [route].concat(others.filter((r, i) => okOthers[i])).join('+'), via: free ? 'player direct' : 'server/' + route });
                 if (free) { res.writeHead(302, { Location: job.u, 'Access-Control-Allow-Origin': '*' }); return res.end(); }
             }
@@ -184,7 +185,7 @@ async function handle(req, res, base) {
         if (playlist) {
             const p = text ? { status: 200, url: finalUrl, text } : await fetchText(route, job.u, headers);
             if (p.status < 400 && /^#EXTM3U/.test(p.text.trim())) {
-                const body = await rewritePlaylist(p.text, p.url, base, job.h, route);
+                const body = await rewritePlaylist(p.text, p.url, base, job.h, route, !!job.fp);
                 res.writeHead(200, { 'Content-Type': 'application/vnd.apple.mpegurl', 'Access-Control-Allow-Origin': '*', 'Cache-Control': 'no-cache' });
                 return res.end(body);
             }
@@ -211,7 +212,7 @@ function markFresh(link) {
     const job = jobOf(link);
     if (!job) return link;
     const base = link.slice(0, link.indexOf('/p/'));
-    return proxyUrl(base, job.u, job.h, job.r, job.s, job.re, true);
+    return proxyUrl(base, job.u, job.h, job.r, job.s, job.re, true, !!job.fp);
 }
 
 module.exports = { jobOf, markFresh, setRefresher: fn => { refresher = fn; }, usage: () => Object.assign({}, usage, { capGB: CAP_BYTES / 1024 ** 3, usedMB: Math.round(usage.bytes / 1048576), decisions }), wanted, proxyUrl, handle, rewritePlaylist, mode: MODE, hosts: HOSTS };

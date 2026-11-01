@@ -7,6 +7,7 @@
 const http = require('http');
 const net = require('./net.js');
 const passthrough = require('./stream.js');
+const ard = require('./mediathek.js');
 let publicBase = (process.env.PUBLIC_URL || '').replace(/\/$/, '');   // learnt from the first request if not set
 // the scrapers call the global fetch(): route it through the Chrome-like / WARP connection layer
 globalThis.fetch = net.smartFetch;
@@ -23,19 +24,31 @@ const KEY_FILE = process.env.KEY_FILE || require('path').join(__dirname, '.tmdb-
 let keyStatus = TMDB_API_KEY ? 'from settings' : 'missing';
 function setKey(k, how) { TMDB_API_KEY = k; globalThis.TMDB_API_KEY = k; keyStatus = how; try { require('fs').writeFileSync(KEY_FILE, k); } catch (e) {} }
 if (!TMDB_API_KEY) { try { const k = require('fs').readFileSync(KEY_FILE, 'utf8').trim(); if (k) { TMDB_API_KEY = k; keyStatus = 'saved earlier'; } } catch (e) {} }
+// tmdb-key.enc (in the repo, encrypted with RELAY_TOKEN): the key survives every rebuild without Render
+function keyFromRepo() {
+    try {
+        const c = require('crypto');
+        const e = JSON.parse(require('fs').readFileSync(require('path').join(__dirname, 'tmdb-key.enc'), 'utf8'));
+        const k = c.scryptSync((process.env.RELAY_TOKEN || '').trim(), Buffer.from(e.salt, 'base64'), 32, { N: 1 << 15, r: 8, p: 1, maxmem: 64 * 1024 * 1024 });
+        const d = c.createDecipheriv('aes-256-gcm', k, Buffer.from(e.iv, 'base64'));
+        d.setAuthTag(Buffer.from(e.tag, 'base64'));
+        return Buffer.concat([d.update(Buffer.from(e.data, 'base64')), d.final()]).toString('utf8').trim();
+    } catch (err) { return ''; }
+}
+const RELAY_TOKEN = (process.env.RELAY_TOKEN || '').trim();   // password for /relay/config and /setkey; also unlocks tmdb-key.enc
+if (!TMDB_API_KEY && process.env.RELAY_TOKEN) { const k = keyFromRepo(); if (k) { TMDB_API_KEY = k; keyStatus = 'from encrypted file'; } }
 const TIMEOUT_MS = Number(process.env.TIMEOUT_MS) || 15000;       // how long the addon waits before answering
-const CACHE_MIN = Number(process.env.CACHE_MINUTES) || 10;        // reuse results (stream links expire, keep short)
+const CACHE_MIN = Number(process.env.CACHE_MINUTES) || 1440;      // reuse results; expired links refresh themselves on play
+const SOFT_MS = process.env.SOFT_MS === undefined ? 6000 : Number(process.env.SOFT_MS);   // answer once German streams are in after this, don't wait for slow sites
 const ONLY = (process.env.PROVIDERS || '').split(',').map(s => s.trim()).filter(Boolean);   // e.g. "serienstream,aniworld,ard"
 const SKIP = (process.env.SKIP_PROVIDERS || '').split(',').map(s => s.trim()).filter(Boolean);
 const AUTO_UPDATE = process.env.AUTO_UPDATE !== '0';               // pull the latest provider files from his repo
 const UPDATE_URL = process.env.UPDATE_URL || 'https://invalidpandaa.github.io/nuvio-german-providers/';
 const UPDATE_HOURS = Number(process.env.UPDATE_HOURS) || 12;
 const PREFETCH = process.env.PREFETCH !== '0';                    // look up the next episode in advance
-const PREFETCH_MIN = Number(process.env.PREFETCH_MINUTES) || 40;  // how long a prefetched result is kept
-// Home relay: a copy of this addon running on the FireTV (home internet) registers its tunnel address here, and
-// /stream requests are passed to it, because many sites (VOE, AniWorld …) block data-centre servers like Render.
-const RELAY_TOKEN = (process.env.RELAY_TOKEN || '').trim();
-let relay = null;   // { url, time }
+const PREFETCH_MIN = Number(process.env.PREFETCH_MINUTES) || 1440;  // how long a prefetched result is kept
+let warpDownSince = 0;
+setInterval(() => { if (net.warpOn()) warpDownSince = 0; else if (!warpDownSince) warpDownSince = Date.now(); }, 60000).unref();
 
 globalThis.TMDB_API_KEY = TMDB_API_KEY;   // the plugins read the key from here, like inside Nuvio
 
@@ -43,7 +56,7 @@ globalThis.TMDB_API_KEY = TMDB_API_KEY;   // the plugins read the key from here,
 const BUNDLED_DIR = fs.existsSync(path.join(__dirname, 'providers', 'manifest.json')) ? path.join(__dirname, 'providers') : __dirname;
 const CACHE_DIR = process.env.DATA_DIR || path.join(__dirname, '.provider-cache');   // inside the project so require('cheerio') resolves
 
-const log = (...a) => console.log(new Date().toISOString(), ...a);
+const log = (...a) => console.log(new Date().toISOString(), ...a.map(x => typeof x === 'string' ? x.replace(/(api_key=)[^&"\s]+/g, '$1***') : x));
 
 // ---------- loading the plugins ----------
 let providers = [];   // [{ id, name, types, mod, lock }]
@@ -81,12 +94,16 @@ function loadFrom(dir) {
             log(`provider ${s.id} failed to load: ${e.message}`);
         }
     }
+    // built in (not one of the plugins): ARD daily soaps such as "Sturm der Liebe", matched by broadcast date
+    if (!SKIP.includes('ardsoap') && (!ONLY.length || ONLY.includes('ardsoap')))
+        list.push({ id: 'ardsoap', name: 'ARD', types: ['tv'], mod: ard, lock: Promise.resolve() });
     if (!list.length) throw new Error(`no providers loaded from ${dir}`);
     providers = list;
     pluginVersion = manifest.version;
     log(`loaded ${list.length} providers v${manifest.version} from ${dir === BUNDLED_DIR ? 'bundled copy' : 'update cache'}: ${list.map(p => p.id).join(', ')}`);
 }
 
+const UPDATE_TEST_TMDB = process.env.UPDATE_TEST_TMDB || '603';   // The Matrix: on almost every site
 async function update() {
     try {
         const manifest = await (await fetch(UPDATE_URL + 'manifest.json')).json();
@@ -98,7 +115,19 @@ async function update() {
             fs.writeFileSync(path.join(CACHE_DIR, s.filename.replace(/^providers\//, '')), await res.text());
         }
         fs.writeFileSync(path.join(CACHE_DIR, 'manifest.json'), JSON.stringify(manifest));
+        // try the new version on a sample film before switching; keep the old one if it does clearly worse
+        const before = { list: providers, version: pluginVersion };
+        const sample = async () => (await Promise.all(providers.filter(p => p.types.includes('movie'))
+            .map(p => runProvider(p, UPDATE_TEST_TMDB, 'movie', null, null).then(l => (l || []).length, () => 0)))).reduce((a, b) => a + b, 0);
+        const oldScore = await sample();
         loadFrom(CACHE_DIR);
+        const newScore = await sample();
+        if (newScore < Math.max(1, Math.floor(oldScore / 2))) {
+            providers = before.list; pluginVersion = before.version;
+            log(`plugin update v${manifest.version} looked broken (${newScore} vs ${oldScore} test streams), keeping v${before.version}`);
+            return;
+        }
+        log(`plugin update v${manifest.version} passed its test (${newScore} vs ${oldScore} test streams)`);
         cache.clear();
     } catch (e) {
         log(`update check failed, keeping v${pluginVersion}: ${e.message}`);
@@ -114,9 +143,16 @@ function withLimit(promise, ms, what) {
     return Promise.race([promise, new Promise((_, reject) => { timer = setTimeout(() => reject(new Error(`${what} took longer than ${ms / 1000}s`)), ms); })])
         .finally(() => clearTimeout(timer));
 }
+// a site that fails 3 times in a row (errors / hangs) is paused for an hour, then tried again
+const PAUSE_AFTER = 3, PAUSE_MS = 60 * 60000;
 function runProvider(p, tmdbId, type, season, episode) {
+    if (p.pausedUntil > Date.now()) return Promise.resolve([]);
     const job = p.lock.then(() => withLimit(Promise.resolve().then(() => p.mod.getStreams(tmdbId, type, season, episode)), PROVIDER_LIMIT_MS, p.id));
     p.lock = job.catch(() => {});
+    job.then(() => { p.fails = 0; }, err => {
+        p.fails = (p.fails || 0) + 1;
+        if (p.fails >= PAUSE_AFTER) { p.pausedUntil = Date.now() + PAUSE_MS; p.fails = 0; log(`${p.id} failed ${PAUSE_AFTER}x in a row (${err.message}), paused for an hour`); }
+    });
     return job;
 }
 
@@ -140,12 +176,39 @@ async function toTmdb(imdbId, type) {
 const LANG_KEY = lang => (lang === 'Deutsch' ? 'de' : /dt\. UT|OmU/.test(lang) ? 'de-sub' : 'other');
 const RANK = { de: 0, 'de-sub': 1, other: 2 };
 
+// ---------- display (same style as Fortune's AIOStreams "Select" template) ----------
+const RES_LABEL = q => /2160|\b4k\b|uhd/i.test(q) ? '𝟰𝗞' : /1440/.test(q) ? '𝗤𝗛𝗗' : /1080/.test(q) ? '𝗙𝗛𝗗' : /720/.test(q) ? '𝗛𝗗'
+    : /\b(480|360|240)p?\b|\bsd\b/i.test(q) ? '𝗦𝗗' : /auto|hls|m3u8/i.test(q) ? '𝗔𝘂𝘁𝗼' : '𝗨𝗻𝗸𝗻𝗼𝘄𝗻';
+const LANG_EN = { Deutsch: 'German', Englisch: 'English', 'Französisch': 'French', Japanisch: 'Japanese', Spanisch: 'Spanish', Italienisch: 'Italian', 'Türkisch': 'Turkish', Russisch: 'Russian' };
+function hostLabel(text) {
+    const t = String(text || '').split('\n')[0].trim();
+    const m = t.match(/^([a-z0-9-]+)\.[a-z0-9.-]+$/i);           // a bare domain like voe.sx -> VOE
+    if (!m) return t;
+    const w = m[1];
+    if (w.includes('-')) return t.toLowerCase();                   // moflix-stream.fans: keep the whole name, the ending matters
+    return w.length <= 4 ? w.toUpperCase() : w.charAt(0).toUpperCase() + w.slice(1);
+}
+const pad2 = n => String(n).padStart(2, '0');
+const metaCache = new Map();   // "tv:123" -> { title, year }
+async function showMeta(pType, tmdbId) {
+    const k = `${pType}:${tmdbId}`;
+    if (metaCache.has(k)) return metaCache.get(k);
+    try {
+        const r = await fetch(`https://api.themoviedb.org/3/${pType}/${tmdbId}?api_key=${TMDB_API_KEY}&language=en-GB`, { signal: AbortSignal.timeout(5000) });
+        const d = r.ok ? await r.json() : {};
+        const m = { title: d.title || d.name || '', year: String(d.release_date || d.first_air_date || '').slice(0, 4) };
+        if (m.title) { metaCache.set(k, m); if (metaCache.size > 3000) metaCache.delete(metaCache.keys().next().value); }
+        return m;
+    } catch (e) { return { title: '', year: '' }; }
+}
+
+// always through the Frankfurt server, even when the host would allow direct play (Germany-only broadcasters)
+const FORCE_THROUGH = ['ardsoap'];
 function toAddonStream(s, provider, ctx) {
     // s.name looks like "Serienstream · Deutsch · voe.sx" (built by the plugin)
     const parts = (s.name || provider.name).split(' · ');
     const lang = parts[1] || 'Deutsch';
     const key = LANG_KEY(lang);
-    const flag = key === 'de' ? '🇩🇪' : key === 'de-sub' ? '🇩🇪 UT' : '🌐';
     const quality = s.quality || 'auto';
     let headers = s.headers && Object.keys(s.headers).length ? s.headers : null;
     let url = s.url;
@@ -154,11 +217,16 @@ function toAddonStream(s, provider, ctx) {
         const source = ((`${parts.join(' ')} ${s.title || ''}`).match(/\b([a-z0-9-]+\.(?:[a-z0-9-]+\.)*[a-z]{2,})\b/i) || [])[1];
         const host = (parts[2] || source || '').toLowerCase();
         const re = ctx ? [ctx.type, ctx.id, provider.id, host] : null;
-        url = passthrough.proxyUrl(publicBase, s.url, headers, null, source && source.toLowerCase(), re);
+        url = passthrough.proxyUrl(publicBase, s.url, headers, null, source && source.toLowerCase(), re, false, FORCE_THROUGH.includes(provider.id));
     }
+    // left: resolution like 𝗙𝗛𝗗;  right: "Merlin S01 ･ E05" / "Frankenstein ･ 2025", provider · host, language
+    const meta = (ctx && ctx.meta) || {};
+    const head = meta.title ? (ctx.season != null ? `${meta.title} S${pad2(ctx.season)} ･ E${pad2(ctx.episode)}` : `${meta.title}${meta.year ? ' ･ ' + meta.year : ''}`) : '';
+    const hostText = hostLabel(parts[2] || s.title || '');
+    const langText = key === 'de' ? '🇩🇪 German' : key === 'de-sub' ? '🇩🇪 German subs' : `🌐 ${LANG_EN[lang] || lang}`;
     const out = {
-        name: `${flag} DE Providers\n${quality}`,
-        title: [`${parts[0]} · ${lang}`, s.title].filter(Boolean).join('\n'),
+        name: RES_LABEL(`${quality} ${s.name || ''}`),
+        title: [head, `▫ ${parts[0]}${hostText && hostText !== parts[0] ? ' · ' + hostText : ''}`, `▫ ${langText}`].filter(Boolean).join('\n'),
         url,
         behaviorHints: {
             // same group on every episode -> Nuvio/Stremio pick this addon again for the next episode
@@ -170,7 +238,10 @@ function toAddonStream(s, provider, ctx) {
     };
     out.description = out.title;
     if (headers) out.headers = headers;   // Nuvio-style field, ignored by apps that don't know it
-    return { rank: RANK[key], stream: out };
+    // quality score for sorting: labelled 4K/1080p first; 'auto' (adaptive HLS, often up to 1080p) counts like 720p
+    const qtext = `${quality} ${s.name || ''} ${s.title || ''}`;
+    const q = /2160|\b4k\b|uhd/i.test(qtext) ? 4 : /1080/.test(qtext) ? 3 : /720/.test(qtext) ? 2 : /\b(480|360|240)p?\b|\bsd\b/i.test(qtext) ? 1 : 2;
+    return { rank: RANK[key], q, label: parts.join(' '), stream: out };
 }
 
 // ---------- the stream lookup with cache ----------
@@ -229,6 +300,8 @@ async function lookup(type, id) {
         tmdbId = /^tt\d+$/.test(imdbOrTmdb) ? await toTmdb(imdbOrTmdb, pType) : imdbOrTmdb;
     }
     if (!tmdbId) return [];
+    ctx.season = pType === 'tv' ? season : null; ctx.episode = episode;
+    ctx.meta = await showMeta(pType, tmdbId);
 
     const active = providers.filter(p => p.types.includes(pType));
     const results = [];
@@ -251,6 +324,11 @@ async function lookup(type, id) {
     let early = false;
     const waits = [Promise.all(runs), new Promise(r => setTimeout(r, TIMEOUT_MS))];
     if (hadRuns.length) waits.push(Promise.all(hadRuns).then(() => new Promise(r => setTimeout(r, KNOWN_GRACE_MS)))) ;
+    // new title: answer after SOFT_MS as soon as there is at least one German stream (late sites still fill the cache)
+    else if (SOFT_MS > 0) waits.push(new Promise(r => {
+        const tick = () => { if (results.some(x => x.rank === 0)) r(); else if (finished < runs.length) setTimeout(tick, 500); };
+        setTimeout(tick, SOFT_MS);
+    }));
     await Promise.race(waits);
     const allDone = finished === runs.length;
     early = !allDone;
@@ -275,14 +353,36 @@ async function lookup(type, id) {
 const PREFERRED = (process.env.PROVIDER_ORDER || 'serienstream,aniworld,huhuto,moflix,filmpalast,megakino,kinoking,hdfilme,filmo,kellerkino,flixitv,filmfrei24,ard,arte,dmax,tele5,tlc,southpark,netzkino,plutotv')
     .split(',').map(x => x.trim());
 const prefIndex = id => { const i = PREFERRED.indexOf(id); return i < 0 ? PREFERRED.length : i; };
-const DEMOTE = new RegExp(process.env.DEMOTE_HOSTS || 'supervideo|dropload|dr0pstream', 'i');
-const demoted = x => (DEMOTE.test(`${x.stream.title} ${x.stream.name}`) ? 1 : 0);
-const sortStreams = list => list.slice().sort((a, b) => demoted(a) - demoted(b) || a.rank - b.rank || a.pref - b.pref || a.order - b.order || a.i - b.i).map(x => x.stream);
+const DEMOTE = new RegExp(process.env.DEMOTE_HOSTS || 'supervideo|dropload|dr0pstream|moflix-stream\\.click', 'i');
+const demoted = x => (DEMOTE.test(`${x.label || ''} ${x.stream.title} ${x.stream.name}`) ? 1 : 0);
+const GERMAN_ONLY = process.env.GERMAN_ONLY !== '0';            // hide other languages when German exists
+const MAX_PER_HOST = Number(process.env.MAX_PER_HOST) || 2;        // streams kept per site + host + language
+// the real video address behind a stream (pass-through links carry it inside), without the changing ?token part
+function videoKey(st) {
+    const job = passthrough.jobOf(st.url);
+    const u = (job && job.u) || st.url || '';
+    try { const x = new URL(u); return x.host + x.pathname; } catch (e) { return u.split('?')[0]; }
+}
+const sortStreams = list => {
+    const sorted = list.slice().sort((a, b) => demoted(a) - demoted(b) || a.rank - b.rank || (b.q || 0) - (a.q || 0) || a.pref - b.pref || a.order - b.order || a.i - b.i);
+    const hasGerman = sorted.some(x => x.rank < 2);
+    const seen = new Set(), perHost = new Map(), out = [];
+    for (const x of sorted) {
+        if (GERMAN_ONLY && hasGerman && x.rank === 2) continue;      // German exists: drop English/French/…
+        const vk = videoKey(x.stream);
+        if (vk && seen.has(vk)) continue;                           // same upload already listed via another site
+        const hk = `${x.provider || ''}|${x.label || ''}|${x.q}`;
+        const n = perHost.get(hk) || 0;
+        if (n >= MAX_PER_HOST) continue;                            // enough from this site + host already
+        seen.add(vk); perHost.set(hk, n + 1); out.push(x.stream);
+    }
+    return out;
+};
 
-// an expired link from the player's cache: search that episode again and send the player to the same provider's
-// new link for the same host (or another link of that provider). One search per episode at a time.
+// a link that fails to start (expired in the player's cache, or deleted at the host): search the episode again and
+// send the player to a working link, staying on the same site where possible. One search per episode at a time.
 const refreshing = new Map();
-passthrough.setRefresher(async ([type, id, prov, host]) => {
+passthrough.setRefresher(async ([type, id, prov, host], failedUrl) => {
     const key = `${type}:${id}`;
     if (!refreshing.has(key)) {
         log(`refreshing expired link: ${key} (${prov} ${host})`);
@@ -291,10 +391,17 @@ passthrough.setRefresher(async ([type, id, prov, host]) => {
         refreshing.set(key, p);
     }
     const streams = await refreshing.get(key);
-    const mine = streams.filter(st => (st.behaviorHints || {}).bingeGroup && st.behaviorHints.bingeGroup.startsWith(`german-providers-${prov}-`));
+    // never hand back the very video that just failed (deleted files come back from the site unchanged)
+    const deadKey = failedUrl ? videoKey({ url: failedUrl }) : null;
+    const alive = streams.filter(st => !deadKey || videoKey(st) !== deadKey);
+    const mine = alive.filter(st => (st.behaviorHints || {}).bingeGroup && st.behaviorHints.bingeGroup.startsWith(`german-providers-${prov}-`));
     const job = st => passthrough.jobOf(st.url) || {};
-    const pick = mine.find(st => (job(st).re || [])[3] === host) || mine.find(st => passthrough.jobOf(st.url));
-    return pick ? passthrough.markFresh(pick.url) : null;
+    // same site + host; else same site, other host; else same host via another site; else the best German stream left
+    const pick = mine.find(st => (job(st).re || [])[3] === host) || mine[0]
+        || alive.find(st => (job(st).re || [])[3] === host) || alive[0];
+    if (!pick) return null;
+    if (!passthrough.jobOf(pick.url)) return pick.url;            // a direct link (e.g. a broadcaster): just redirect
+    return passthrough.markFresh(pick.url);
 });
 
 function getStreams(type, id, prefetched) {
@@ -403,15 +510,14 @@ async function runAudit(audit) {
 }
 
 // ---------- HTTP server ----------
-const relayAlive = () => !!relay && Date.now() - relay.time < 12 * 60000;
 
 function addonManifest() {
     return {
         id: 'community.german-providers.addon',
-        version: '1.3.0',
+        version: '1.5.0',
         name: 'German Providers',
         description: `Deutsche Quellen (s.to, AniWorld, ARD, Arte, FilmPalast …) als Addon. Plugins v${pluginVersion} von InvalidPandaa/nuvio-german-providers (GPL-3.0).`,
-        logo: 'https://flagcdn.com/w160/de.png',
+        logo: publicBase ? `${publicBase}/logo.png` : 'https://flagcdn.com/w160/de.png',
         resources: ['stream'],
         types: ['movie', 'series', 'anime'],
         idPrefixes: ['tt', 'tmdb:', 'kitsu:', 'mal:', 'anilist:', 'anidb:'],
@@ -427,7 +533,7 @@ function send(res, code, body, maxAge) {
         'Access-Control-Allow-Headers': '*',
         'Cache-Control': maxAge ? `max-age=${maxAge}` : 'no-cache',
     });
-    res.end(JSON.stringify(body));
+    res.end(JSON.stringify(body).replace(/(api_key=)[^&"\s]+/g, '$1***'));
 }
 
 const server = http.createServer(async (req, res) => {
@@ -438,7 +544,20 @@ const server = http.createServer(async (req, res) => {
     const url = decodeURIComponent((req.url || '/').split('?')[0]);
     if (req.method === 'OPTIONS') return send(res, 204, {});
     if (url === '/' || url === '/health') {
-        return send(res, 200, { ok: true, homeRelay: relayAlive() ? 'online' : 'offline', addon: `${req.headers['x-forwarded-proto'] || 'http'}://${req.headers.host}/manifest.json`, plugins: pluginVersion, providers: providers.map(p => p.id), tmdbKey: !!TMDB_API_KEY, tmdbKeyStatus: keyStatus });
+        // a real check: cron-job.org's "notify on failure" emails when this is not 200
+        const problems = [];
+        if (!TMDB_API_KEY) problems.push('TMDB key missing');
+        if (!providers.length) problems.push('no providers loaded');
+        if (process.env.WARP !== '0' && warpDownSince && Date.now() - warpDownSince > 30 * 60000) problems.push('WARP down for over 30 minutes');
+        const paused = providers.filter(p => p.pausedUntil > Date.now()).map(p => p.id);
+        return send(res, problems.length ? 503 : 200, { ok: !problems.length, problems, warp: net.warpOn(), addon: `${req.headers['x-forwarded-proto'] || 'http'}://${req.headers.host}/manifest.json`, plugins: pluginVersion, providers: providers.map(p => p.id), paused, tmdbKey: !!TMDB_API_KEY, tmdbKeyStatus: keyStatus });
+    }
+    if (url === '/logo.png') {
+        try {
+            const img = fs.readFileSync(path.join(__dirname, 'logo.png'));
+            res.writeHead(200, { 'Content-Type': 'image/png', 'Cache-Control': 'max-age=86400', 'Access-Control-Allow-Origin': '*' });
+            return res.end(img);
+        } catch (e) { res.writeHead(404); return res.end(); }
     }
     if (url === '/manifest.json') return send(res, 200, addonManifest(), 3600);
     if (url === '/diag' || url.startsWith('/diag/')) return send(res, 200, await net.diag());
@@ -501,7 +620,6 @@ const server = http.createServer(async (req, res) => {
     const dj = url.match(/^\/debug\/job\/([a-z0-9]+)/);
     if (dj) return send(res, 200, jobs.get(dj[1]) || { error: 'unknown job' });
 
-    // ---- home relay ----
     const q = new URL(req.url || '/', 'http://x').searchParams;
     // set the TMDB key from a browser: /setkey?token=<RELAY_TOKEN>&key=<TMDB key>
     if (url === '/setkey') {
@@ -514,14 +632,9 @@ const server = http.createServer(async (req, res) => {
         log('TMDB key set by link');
         return send(res, 200, { ok: true, tmdbKey: true });
     }
-    if (url === '/relay/register' || url === '/relay/config') {
+    if (url === '/relay/config') {
         if (!RELAY_TOKEN || q.get('token') !== RELAY_TOKEN) return send(res, 403, { error: 'wrong token' });
-        if (url === '/relay/config') return send(res, 200, { tmdbKey: TMDB_API_KEY });
-        const target = q.get('url') || '';
-        if (!/^https:\/\/[a-z0-9-]+\.trycloudflare\.com$/.test(target)) return send(res, 400, { error: 'bad url' });
-        if (!relay || relay.url !== target) log(`home relay registered: ${target}`);
-        relay = { url: target, time: Date.now() };
-        return send(res, 200, { ok: true });
+        return res.writeHead(200, { 'Content-Type': 'application/json' }), res.end(JSON.stringify({ tmdbKey: TMDB_API_KEY }));
     }
 
     // diagnostics: /check/series/tt0944947:1:1  -> what every provider returns from this server (no cache)
@@ -548,25 +661,20 @@ const server = http.createServer(async (req, res) => {
     if (!TMDB_API_KEY) return send(res, 200, { streams: [], error: 'TMDB_API_KEY is not set' });
     const t0 = Date.now();
     log(`stream ${m[1]} ${m[2]}`);
-    if (relayAlive()) {
-        try {
-            const r = await fetch(relay.url + url, { signal: AbortSignal.timeout(TIMEOUT_MS + 10000) });
-            const body = await r.json();
-            if (!r.ok || !Array.isArray(body.streams)) throw new Error(`HTTP ${r.status}`);
-            log(`  -> ${body.streams.length} streams from home relay in ${Date.now() - t0} ms`);
-            return send(res, 200, body);
-        } catch (e) {
-            log(`  home relay failed (${e.message}), searching from here instead`);
-            relay = null;
-        }
-    }
     try {
         const streams = await getStreams(m[1], m[2]);
         // autoplay asks for the next episode only seconds before it starts; have the answer ready by then
         const ep = m[1] !== 'movie' && m[2].match(/^(.*):(\d+):(\d+)$/);
         if (PREFETCH && ep && streams.length) {
             const next = `${ep[1]}:${ep[2]}:${Number(ep[3]) + 1}`;
-            setTimeout(() => getStreams(m[1], next, true).then(l => log(`prefetched ${next}: ${l.length} streams`), () => {}), 5000);
+            setTimeout(() => getStreams(m[1], next, true).then(l => {
+                log(`prefetched ${next}: ${l.length} streams`);
+                // nothing there: probably the season's last episode, so get the next season's first one ready
+                if (!l.length) {
+                    const first = `${ep[1]}:${Number(ep[2]) + 1}:1`;
+                    return getStreams(m[1], first, true).then(f => log(`prefetched ${first}: ${f.length} streams`));
+                }
+            }).catch(() => {}), 5000);
         }
         log(`  -> ${streams.length} streams in ${Date.now() - t0} ms`);
         send(res, 200, { streams, cacheMaxAge: 300 });
@@ -598,4 +706,4 @@ if (require.main === module) {
     if (AUTO_UPDATE) { update(); setInterval(update, UPDATE_HOURS * 3600000).unref(); }
 }
 
-module.exports = { _setBase: b => { publicBase = b; }, _setRelay: r => { relay = r; }, server, loadFrom, toAddonStream, getStreams, _cache: cache, _providers: () => providers };
+module.exports = { _setBase: b => { publicBase = b; }, server, loadFrom, toAddonStream, getStreams, _update: update, _cache: cache, _providers: () => providers };
