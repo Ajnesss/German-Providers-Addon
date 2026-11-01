@@ -204,6 +204,14 @@ async function showMeta(pType, tmdbId) {
 
 // always through the Frankfurt server, even when the host would allow direct play (Germany-only broadcasters)
 const FORCE_THROUGH = ['ardsoap'];
+function releaseName(meta, ctx, quality, s, key, lang, site, host) {
+    const clean = t => String(t || '').normalize('NFD').replace(/[\u0300-\u036f]/g, '').replace(/ß/g, 'ss').replace(/[^A-Za-z0-9]+/g, '.').replace(/^\.+|\.+$/g, '');
+    const qtext = `${quality} ${s.name || ''} ${s.title || ''}`;
+    const res = /2160|\b4k\b|uhd/i.test(qtext) ? '2160p' : /1080/.test(qtext) ? '1080p' : /720/.test(qtext) ? '720p' : /\b480p?\b/.test(qtext) ? '480p' : '';
+    const ep = ctx && ctx.season != null ? `S${pad2(ctx.season)}E${pad2(ctx.episode)}` : (meta.year || '');
+    const language = key === 'de' ? 'German' : key === 'de-sub' ? 'German.Subs' : (LANG_EN[lang] || lang);
+    return [clean(meta.title), ep, res, clean(language), clean(site), clean(host)].filter(Boolean).join('.');
+}
 function toAddonStream(s, provider, ctx) {
     // s.name looks like "Serienstream · Deutsch · voe.sx" (built by the plugin)
     const parts = (s.name || provider.name).split(' · ');
@@ -232,6 +240,8 @@ function toAddonStream(s, provider, ctx) {
             // same group on every episode -> Nuvio/Stremio pick this addon again for the next episode
             // per provider: start on Huhu and the next episode stays on Huhu (only falls back if Huhu has nothing)
             bingeGroup: `german-providers-${provider.id}-${key}`,
+            // release-style name: Nuvio's badge rules read it (resolution, language); only facts we really know
+            filename: releaseName(meta, ctx, quality, s, key, lang, parts[0], hostText),
             notWebReady: !!headers || undefined,
             proxyHeaders: headers ? { request: headers } : undefined,
         },
@@ -514,7 +524,7 @@ async function runAudit(audit) {
 function addonManifest() {
     return {
         id: 'community.german-providers.addon',
-        version: '1.5.0',
+        version: '1.5.1',
         name: 'German Providers',
         description: `Deutsche Quellen (s.to, AniWorld, ARD, Arte, FilmPalast …) als Addon. Plugins v${pluginVersion} von InvalidPandaa/nuvio-german-providers (GPL-3.0).`,
         logo: publicBase ? `${publicBase}/logo.png` : 'https://flagcdn.com/w160/de.png',
