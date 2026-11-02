@@ -557,7 +557,7 @@ async function runAudit(audit) {
 function addonManifest() {
     return {
         id: 'community.german-providers.addon',
-        version: '1.6.0',
+        version: '1.6.1',
         name: 'German Providers',
         description: `Deutsche Quellen (s.to, AniWorld, ARD, Arte, FilmPalast …) als Addon. Plugins v${pluginVersion} von InvalidPandaa/nuvio-german-providers (GPL-3.0).`,
         logo: publicBase ? `${publicBase}/logo.png` : 'https://flagcdn.com/w160/de.png',
@@ -615,6 +615,22 @@ const server = http.createServer(async (req, res) => {
         if (jobs.size > 30) jobs.delete(jobs.keys().next().value);
         runDebugJob(job, ds[3] ? ds[3].split(',') : null).catch(e => { job.error = e.message; job.done = true; });
         return send(res, 200, { job: id, result: `/debug/job/${id}` });
+    }
+    // look at a video host page from the server (for building/fixing readers): /debug/fetch?token=<RELAY_TOKEN>&url=...&ref=...
+    // password-protected so the server can't be used as an open proxy
+    if (url === '/debug/fetch') {
+        const q = new URL(req.url, 'http://x').searchParams;
+        if (!RELAY_TOKEN || q.get('token') !== RELAY_TOKEN) return send(res, 403, { error: 'wrong token' });
+        try {
+            const h = { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36' };
+            if (q.get('ref')) h.Referer = q.get('ref');
+            const opts = { headers: h };
+            if (q.get('post') != null) { opts.method = 'POST'; opts.body = q.get('post'); h['Content-Type'] = q.get('ctype') || 'application/json'; }
+            const r = await net.smartFetch(q.get('url'), opts);   // same connections the plugins use (incl. WARP)
+            const text = await r.text();
+            const at = Number(q.get('from')) || 0;
+            return send(res, 200, { status: r.status, url: r.url, type: r.headers.get('content-type'), length: text.length, body: text.slice(at, at + 20000) });
+        } catch (e) { return send(res, 200, { error: e.message }); }
     }
     // Filemoon/Byse test: /debug/byse?url=https://filemoon.to/e/<code>
     if (url === '/debug/byse') {
