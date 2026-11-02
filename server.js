@@ -72,6 +72,9 @@ function loadPlugin(file) {
         // send Dood links to the plugin's own Dood extractor (player page /e/ with the video link), not the generic sniffer
         if (/^function dood\(/m.test(code)) code = code.replace(/^var HOSTS = \[/m, 'var HOSTS = [\n  [dood, ["dood", "d000d.com", "d0000d.com", "ds2play.com", "doodstream.com", "dooodster.com", "vide0.net", "dsvplay.com", "do7go.com", "playmogo.com", "doods.pro"]],');
     }
+    // Filemoon moved to a new player ("Byse"); the plugins' old reader finds nothing there any more
+    if (process.env.BYSE !== '0' && code.includes('[filemoon, ["filemoon"]]'))
+        code = `var __byse = require(${JSON.stringify(path.join(__dirname, 'byse.js'))});\n` + code.replace('[filemoon, ["filemoon"]]', '[__byse.forPlugins, ["filemoon", "byse", "bysekoze"]]');
     const m = new Module(file, module);
     m.filename = file;
     m.paths = Module._nodeModulePaths(path.dirname(file));
@@ -365,7 +368,8 @@ const PREFERRED = (process.env.PROVIDER_ORDER || 'serienstream,aniworld,huhuto,m
 const prefIndex = id => { const i = PREFERRED.indexOf(id); return i < 0 ? PREFERRED.length : i; };
 const DEMOTE = new RegExp(process.env.DEMOTE_HOSTS || 'supervideo|dropload|dr0pstream|moflix-stream\\.click', 'i');
 const demoted = x => (DEMOTE.test(`${x.label || ''} ${x.stream.title} ${x.stream.name}`) ? 1 : 0);
-const GERMAN_ONLY = process.env.GERMAN_ONLY !== '0';            // hide other languages when German exists
+const GERMAN_ONLY = process.env.GERMAN_ONLY !== '0';            // German audio only: other languages and German-subtitle streams are never shown
+const KEEP_GERMAN_SUBS = process.env.GERMAN_SUBS === '1';       // set GERMAN_SUBS=1 to also show original audio with German subtitles
 const MAX_PER_HOST = Number(process.env.MAX_PER_HOST) || 2;        // streams kept per site + host + language
 // the real video address behind a stream (pass-through links carry it inside), without the changing ?token part
 function videoKey(st) {
@@ -375,10 +379,9 @@ function videoKey(st) {
 }
 const sortStreams = list => {
     const sorted = list.slice().sort((a, b) => demoted(a) - demoted(b) || a.rank - b.rank || (b.q || 0) - (a.q || 0) || a.pref - b.pref || a.order - b.order || a.i - b.i);
-    const hasGerman = sorted.some(x => x.rank < 2);
     const seen = new Set(), perHost = new Map(), out = [];
     for (const x of sorted) {
-        if (GERMAN_ONLY && hasGerman && x.rank === 2) continue;      // German exists: drop English/French/…
+        if (GERMAN_ONLY && (x.rank === 2 || (x.rank === 1 && !KEEP_GERMAN_SUBS))) continue;   // German audio only
         const vk = videoKey(x.stream);
         if (vk && seen.has(vk)) continue;                           // same upload already listed via another site
         const hk = `${x.provider || ''}|${x.label || ''}|${x.q}`;
@@ -484,6 +487,36 @@ async function playCheck(stream) {
     return 'FAIL too many playlists';
 }
 
+const scans = new Map();
+async function runScan(job, show, onlySeason) {
+    const tmdbId = show.startsWith('tt') ? await toTmdb(show, 'tv') : show.split(':')[1];
+    if (!tmdbId) throw new Error('no TMDB match');
+    const d = await (await fetch(`https://api.themoviedb.org/3/tv/${tmdbId}?api_key=${TMDB_API_KEY}&language=de-DE`)).json();
+    job.name = d.name;
+    const eps = [];
+    for (const se of (d.seasons || []).filter(x => x.season_number > 0 && (!onlySeason || x.season_number === onlySeason)))
+        for (let e = 1; e <= se.episode_count; e++) eps.push([se.season_number, e]);
+    let done = 0;
+    job.progress = `0/${eps.length}`;
+    // three at a time; results also land in the normal cache, so the episodes open instantly afterwards
+    const work = async () => {
+        while (eps.length) {
+            const [s, e] = eps.shift();
+            const key = `S${String(s).padStart(2, '0')}E${String(e).padStart(2, '0')}`;
+            let list = [];
+            try { list = await getStreams('series', `${show}:${s}:${e}`); } catch (err) {}
+            const sites = [...new Set(list.map(st => ((st.behaviorHints || {}).bingeGroup || '').replace(/^german-providers-|-de$/g, '')).filter(Boolean))];
+            (job.seasons[s] = job.seasons[s] || {})[key] = list.length ? `German: ${sites.join(', ')}` : 'NO GERMAN';
+            job.progress = `${++done}/${done + eps.length}`;
+        }
+    };
+    await Promise.all([work(), work(), work()]);
+    const all = Object.values(job.seasons).flatMap(o => Object.entries(o));
+    job.missing = all.filter(([, v]) => v === 'NO GERMAN').map(([k]) => k).sort();
+    job.summary = `${all.length - job.missing.length} of ${all.length} episodes have German`;
+    job.done = true;
+    job.finished = new Date().toISOString();
+}
 const audits = new Map();
 async function runAudit(audit) {
     for (const t of AUDIT_TITLES) {
@@ -524,7 +557,7 @@ async function runAudit(audit) {
 function addonManifest() {
     return {
         id: 'community.german-providers.addon',
-        version: '1.5.1',
+        version: '1.6.0',
         name: 'German Providers',
         description: `Deutsche Quellen (s.to, AniWorld, ARD, Arte, FilmPalast …) als Addon. Plugins v${pluginVersion} von InvalidPandaa/nuvio-german-providers (GPL-3.0).`,
         logo: publicBase ? `${publicBase}/logo.png` : 'https://flagcdn.com/w160/de.png',
@@ -583,6 +616,26 @@ const server = http.createServer(async (req, res) => {
         runDebugJob(job, ds[3] ? ds[3].split(',') : null).catch(e => { job.error = e.message; job.done = true; });
         return send(res, 200, { job: id, result: `/debug/job/${id}` });
     }
+    // Filemoon/Byse test: /debug/byse?url=https://filemoon.to/e/<code>
+    if (url === '/debug/byse') {
+        const target = new URL(req.url, 'http://x').searchParams.get('url') || '';
+        const steps = [];
+        try { const list = await require('./byse.js').extract(target, 'https://huhu.to', m => steps.push(m)); return send(res, 200, { ok: !!list.length, steps, streams: list }); }
+        catch (e) { return send(res, 200, { ok: false, steps, error: e.message }); }
+    }
+    // series check: /scan/series/tt0458290[/5]  ->  { job }  then /scan/job/<id>
+    // goes through every episode (or one season) and lists which have German streams, from which sites
+    const sc = url.match(/^\/scan\/series\/(tt\d+|tmdb:\d+)(?:\/(\d+))?\/?$/);
+    if (sc) {
+        const id = Math.random().toString(36).slice(2, 8);
+        const job = { started: new Date().toISOString(), show: sc[1], done: false, progress: '0/?', seasons: {} };
+        scans.set(id, job);
+        if (scans.size > 10) scans.delete(scans.keys().next().value);
+        runScan(job, sc[1], sc[2] ? Number(sc[2]) : null).catch(e => { job.error = e.message; job.done = true; });
+        return send(res, 200, { job: id, result: `/scan/job/${id}` });
+    }
+    const sj = url.match(/^\/scan\/job\/(\w+)$/);
+    if (sj) return send(res, scans.has(sj[1]) ? 200 : 404, scans.get(sj[1]) || { error: 'unknown job' });
     if (url.startsWith('/audit/start')) {
         const id = Math.random().toString(36).slice(2, 8);
         const audit = { started: new Date().toISOString(), done: false, progress: '0/' + AUDIT_TITLES.length, titles: {} };
