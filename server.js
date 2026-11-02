@@ -72,6 +72,9 @@ function loadPlugin(file) {
         // send Dood links to the plugin's own Dood extractor (player page /e/ with the video link), not the generic sniffer
         if (/^function dood\(/m.test(code)) code = code.replace(/^var HOSTS = \[/m, 'var HOSTS = [\n  [dood, ["dood", "d000d.com", "d0000d.com", "ds2play.com", "doodstream.com", "dooodster.com", "vide0.net", "dsvplay.com", "do7go.com", "playmogo.com", "doods.pro"]],');
     }
+    // veev.to: no reader in the plugins (Moflix lists it for many episodes)
+    if (process.env.VEEV !== '0' && /^var HOSTS = \[/m.test(code) && !code.includes('veev.to'))
+        code = `var __veev = require(${JSON.stringify(path.join(__dirname, 'veev.js'))});\n` + code.replace(/^var HOSTS = \[/m, 'var HOSTS = [\n  [__veev.forPlugins, ["veev.to", "veev.pro", "poophq.com", "doods.to"]],');
     // Filemoon moved to a new player ("Byse"); the plugins' old reader finds nothing there any more
     if (process.env.BYSE !== '0' && code.includes('[filemoon, ["filemoon"]]'))
         code = `var __byse = require(${JSON.stringify(path.join(__dirname, 'byse.js'))});\n` + code.replace('[filemoon, ["filemoon"]]', '[__byse.forPlugins, ["filemoon", "byse", "bysekoze"]]');
@@ -557,7 +560,7 @@ async function runAudit(audit) {
 function addonManifest() {
     return {
         id: 'community.german-providers.addon',
-        version: '1.6.1',
+        version: '1.6.2',
         name: 'German Providers',
         description: `Deutsche Quellen (s.to, AniWorld, ARD, Arte, FilmPalast …) als Addon. Plugins v${pluginVersion} von InvalidPandaa/nuvio-german-providers (GPL-3.0).`,
         logo: publicBase ? `${publicBase}/logo.png` : 'https://flagcdn.com/w160/de.png',
@@ -631,6 +634,13 @@ const server = http.createServer(async (req, res) => {
             const at = Number(q.get('from')) || 0;
             return send(res, 200, { status: r.status, url: r.url, type: r.headers.get('content-type'), length: text.length, body: text.slice(at, at + 20000) });
         } catch (e) { return send(res, 200, { error: e.message }); }
+    }
+    // veev test: /debug/veev?url=https://veev.to/e/<code>
+    if (url === '/debug/veev') {
+        const target = new URL(req.url, 'http://x').searchParams.get('url') || '';
+        const steps = [];
+        try { const list = await require('./veev.js').extract(target, m => steps.push(m)); return send(res, 200, { ok: !!list.length, steps, streams: list }); }
+        catch (e) { return send(res, 200, { ok: false, steps, error: e.message }); }
     }
     // Filemoon/Byse test: /debug/byse?url=https://filemoon.to/e/<code>
     if (url === '/debug/byse') {
