@@ -8,7 +8,7 @@
 const API = process.env.MVW_API || 'https://mediathekviewweb.de/api/query';
 const UA = 'Mozilla/5.0 (compatible; GermanProvidersAddon/1.7)';
 // Austrian/Swiss broadcasters only play inside their country; arte's other-language channels aren't German
-const SKIP_CHANNELS = /^(ORF|SRF|ARTE\.(FR|EN|ES|IT|PL))$/i;
+const SKIP_CHANNELS = /^(ORF|SRF|ARTE\.(FR|EN|ES|IT|PL))$/i;   // ORF: only its worldwide files, see geoOk
 const NOT_MAIN = /audiodeskription|h(ö|oe)rfassung|geb(ä|ae)rdensprache|klare sprache|\(englisch\)|\(franz(ö|oe)sisch\)|\(originalversion\)|\(ov\)|\(omu\)|\bomu\b|trailer|vorschau|making-of|\(mit untertitel\)/i;
 
 const cache = new Map();
@@ -58,7 +58,9 @@ function toStreams(hit, title) {
         quality: quality(u),
     }));
 }
-const usable = h => h && (h.url_video_hd || h.url_video) && !SKIP_CHANNELS.test(h.channel || '') && !NOT_MAIN.test(h.title || '');
+// ORF marks the files it may show abroad ("cms-worldwide"): those play from Germany too, the rest is Austria-only
+const geoOk = h => !/^ORF$/i.test(h.channel || '') || /worldwide/i.test(h.url_video_hd || h.url_video || '');
+const usable = h => h && (h.url_video_hd || h.url_video) && (!SKIP_CHANNELS.test(h.channel || '') || geoOk(h)) && geoOk(h) && !NOT_MAIN.test(h.title || '');
 
 async function tmdb(path) {
     return getJson(`https://api.themoviedb.org/3/${path}${path.includes('?') ? '&' : '?'}api_key=${globalThis.TMDB_API_KEY}`);
