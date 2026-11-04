@@ -96,7 +96,10 @@ function loadFrom(dir) {
         if (SKIP.includes(s.id)) continue;
         const file = path.resolve(dir, s.filename.replace(/^providers\//, ''));
         try {
-            const mod = loadPlugin(file);
+            let mod = loadPlugin(file);
+            // FilmFrei24 rebuilt its site; while the plugin still reads the old page, use the new site API instead
+            if (s.id === 'filmfrei24' && process.env.FF24_V2 !== '0' && fs.readFileSync(file, 'utf8').includes('ALL_FILMS'))
+                mod = require('./filmfrei24-v2.js');
             if (typeof mod.getStreams !== 'function') throw new Error('no getStreams');
             list.push({ id: s.id, name: s.name, types: s.supportedTypes || [], mod, lock: Promise.resolve() });
         } catch (e) {
@@ -106,6 +109,9 @@ function loadFrom(dir) {
     // built in (not one of the plugins): ARD daily soaps such as "Sturm der Liebe", matched by broadcast date
     if (!SKIP.includes('ardsoap') && (!ONLY.length || ONLY.includes('ardsoap')))
         list.push({ id: 'ardsoap', name: 'ARD', types: ['tv'], mod: ard, lock: Promise.resolve() });
+    // built in: ZDF, 3sat, KiKA & the other public broadcasters' Mediatheken (films and series), via MediathekViewWeb
+    if (!SKIP.includes('mediathek') && (!ONLY.length || ONLY.includes('mediathek')))
+        list.push({ id: 'mediathek', name: 'Mediathek', types: ['movie', 'tv'], mod: require('./mvw.js'), lock: Promise.resolve() });
     if (!list.length) throw new Error(`no providers loaded from ${dir}`);
     providers = list;
     pluginVersion = manifest.version;
@@ -212,7 +218,7 @@ async function showMeta(pType, tmdbId) {
 }
 
 // always through the Frankfurt server, even when the host would allow direct play (Germany-only broadcasters)
-const FORCE_THROUGH = ['ardsoap'];
+const FORCE_THROUGH = ['ardsoap', 'mediathek'];
 function releaseName(meta, ctx, quality, s, key, lang, site, host) {
     const clean = t => String(t || '').normalize('NFD').replace(/[\u0300-\u036f]/g, '').replace(/ß/g, 'ss').replace(/[^A-Za-z0-9]+/g, '.').replace(/^\.+|\.+$/g, '');
     const qtext = `${quality} ${s.name || ''} ${s.title || ''}`;
@@ -369,7 +375,7 @@ async function lookup(type, id) {
 }
 
 // provider order in the list (within each language group): dedicated streaming sites first, loose matchers last
-const PREFERRED = (process.env.PROVIDER_ORDER || 'serienstream,aniworld,huhuto,moflix,filmpalast,megakino,kinoking,hdfilme,filmo,kellerkino,flixitv,filmfrei24,ard,arte,dmax,tele5,tlc,southpark,netzkino,plutotv')
+const PREFERRED = (process.env.PROVIDER_ORDER || 'serienstream,aniworld,huhuto,moflix,filmpalast,megakino,kinoking,hdfilme,filmo,kellerkino,flixitv,filmfrei24,mediathek,ard,arte,dmax,tele5,tlc,southpark,netzkino,plutotv')
     .split(',').map(x => x.trim());
 const prefIndex = id => { const i = PREFERRED.indexOf(id); return i < 0 ? PREFERRED.length : i; };
 const DEMOTE = new RegExp(process.env.DEMOTE_HOSTS || 'supervideo|dropload|dr0pstream|moflix-stream\\.click', 'i');
@@ -410,17 +416,26 @@ passthrough.setRefresher(async ([type, id, prov, host], failedUrl) => {
         refreshing.set(key, p);
     }
     const streams = await refreshing.get(key);
-    // never hand back the very video that just failed (deleted files come back from the site unchanged)
+    // The same upload usually comes back with a fresh token (expired link): best, it's the very same video. A deleted
+    // upload also comes back looking the same, so every candidate is test-started before the player is sent there.
     const deadKey = failedUrl ? videoKey({ url: failedUrl }) : null;
+    const same = deadKey ? streams.filter(st => videoKey(st) === deadKey && st.url !== failedUrl) : [];
     const alive = streams.filter(st => !deadKey || videoKey(st) !== deadKey);
     const mine = alive.filter(st => (st.behaviorHints || {}).bingeGroup && st.behaviorHints.bingeGroup.startsWith(`german-providers-${prov}-`));
     const job = st => passthrough.jobOf(st.url) || {};
-    // same site + host; else same site, other host; else same host via another site; else the best German stream left
-    const pick = mine.find(st => (job(st).re || [])[3] === host) || mine[0]
-        || alive.find(st => (job(st).re || [])[3] === host) || alive[0];
-    if (!pick) return null;
-    if (!passthrough.jobOf(pick.url)) return pick.url;            // a direct link (e.g. a broadcaster): just redirect
-    return passthrough.markFresh(pick.url);
+    // same video; else same site + host; else same site, other host; else same host via another site; else the best left
+    const order = [].concat(same, mine.filter(st => (job(st).re || [])[3] === host), mine,
+        alive.filter(st => (job(st).re || [])[3] === host), alive).filter((st, i, a) => a.indexOf(st) === i);
+    for (const pick of order.slice(0, 4)) {
+        const url = passthrough.jobOf(pick.url) ? passthrough.markFresh(pick.url) : pick.url;
+        const ok = await playCheck(Object.assign({}, pick, { url })).then(r => /^OK/.test(r), () => false);
+        if (ok) return url;
+        log(`  refresh candidate doesn't start either: ${pick.title ? pick.title.split('\n')[1] || '' : ''}`);
+    }
+    // nothing confirmed: still better than an error screen
+    const fallback = order.find(st => !same.includes(st)) || order[0];
+    if (!fallback) return null;
+    return passthrough.jobOf(fallback.url) ? passthrough.markFresh(fallback.url) : fallback.url;
 });
 
 // After answering, try every link like the player would (a few KB each, in the background) and move links that
@@ -591,7 +606,7 @@ async function runAudit(audit) {
 function addonManifest() {
     return {
         id: 'community.german-providers.addon',
-        version: '1.7.0',
+        version: '1.8.0',
         name: 'German Providers',
         description: `Deutsche Quellen (s.to, AniWorld, ARD, Arte, FilmPalast …) als Addon. Plugins v${pluginVersion} von InvalidPandaa/nuvio-german-providers (GPL-3.0).`,
         logo: publicBase ? `${publicBase}/logo.png` : 'https://flagcdn.com/w160/de.png',
