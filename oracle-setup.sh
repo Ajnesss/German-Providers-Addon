@@ -7,7 +7,12 @@ set -x
 
 REPO=https://github.com/Ajnesss/German-Providers-Addon
 RENDER=https://german-providers-addon.onrender.com
-RELAY_TOKEN=fidio624e1a0e          # same as RELAY_TOKEN on Render: used once to fetch the TMDB key from there
+RELAY_TOKEN="${RELAY_TOKEN:-PUT_YOUR_SECRET_HERE}"   # your private password (unlocks tmdb-key.enc); fill in before use, never commit the real one
+
+# 0. swap space, so the small 1 GB "Micro" server can build and run the addon too (harmless on bigger ones)
+if [ ! -f /swapfile ]; then
+  fallocate -l 2G /swapfile && chmod 600 /swapfile && mkswap /swapfile && swapon /swapfile && echo '/swapfile none swap sw 0 0' >> /etc/fstab
+fi
 
 # 1. Oracle's Ubuntu image blocks every port except SSH: open web ports 80 + 443
 iptables -I INPUT 1 -p tcp --dport 80 -j ACCEPT
@@ -68,7 +73,7 @@ docker rm -f caddy 2>/dev/null
 docker run -d --name caddy --restart always --network host \
   -v /opt/caddy/Caddyfile:/etc/caddy/Caddyfile -v caddy_data:/data caddy:2
 
-# 6. updates: every 15 minutes, pick up new commits from GitHub (no Render-style "Manual Deploy" needed)
-echo '*/15 * * * * root /usr/local/bin/gpa-deploy >> /var/log/gpa-deploy.log 2>&1' > /etc/cron.d/gpa-deploy
+# 6. updates: every 2 minutes, pick up new commits from GitHub (no Render-style "Manual Deploy" needed)
+echo '*/2 * * * * root /usr/local/bin/gpa-deploy >> /var/log/gpa-deploy.log 2>&1' > /etc/cron.d/gpa-deploy
 
 echo "DONE. Addon address: https://$HOST/manifest.json"

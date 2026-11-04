@@ -36,6 +36,13 @@ function keyFromRepo() {
     } catch (err) { return ''; }
 }
 const RELAY_TOKEN = (process.env.RELAY_TOKEN || '').trim();   // password for /relay/config and /setkey; also unlocks tmdb-key.enc
+// Admin pages (debug fetch, set key, relay config) take their own password. Only its SHA-256 fingerprint is stored
+// here, so the public repo never contains it. (RELAY_TOKEN above still unlocks tmdb-key.enc, nothing else.)
+const ADMIN_HASH = (process.env.ADMIN_HASH || '93bd5e64a618aaf5f397cd631cd61dc06021e956b16a317f0ec750c93eaf47fd').trim().toLowerCase();
+const adminOk = q => {
+    const t = String((q && q.get('token')) || '');
+    return !!t && require('crypto').createHash('sha256').update(t).digest('hex') === ADMIN_HASH;
+};
 if (!TMDB_API_KEY && process.env.RELAY_TOKEN) { const k = keyFromRepo(); if (k) { TMDB_API_KEY = k; keyStatus = 'from encrypted file'; } }
 const TIMEOUT_MS = Number(process.env.TIMEOUT_MS) || 15000;       // how long the addon waits before answering
 const CACHE_MIN = Number(process.env.CACHE_MINUTES) || 1440;      // reuse results; expired links refresh themselves on play
@@ -606,7 +613,7 @@ async function runAudit(audit) {
 function addonManifest() {
     return {
         id: 'community.german-providers.addon',
-        version: '1.8.0',
+        version: '1.8.1',
         name: 'German Providers',
         description: `Deutsche Quellen (s.to, AniWorld, ARD, Arte, FilmPalast …) als Addon. Plugins v${pluginVersion} von InvalidPandaa/nuvio-german-providers (GPL-3.0).`,
         logo: publicBase ? `${publicBase}/logo.png` : 'https://flagcdn.com/w160/de.png',
@@ -669,7 +676,7 @@ const server = http.createServer(async (req, res) => {
     // password-protected so the server can't be used as an open proxy
     if (url === '/debug/fetch') {
         const q = new URL(req.url, 'http://x').searchParams;
-        if (!RELAY_TOKEN || q.get('token') !== RELAY_TOKEN) return send(res, 403, { error: 'wrong token' });
+        if (!adminOk(q)) return send(res, 403, { error: 'wrong token' });
         try {
             const h = { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36' };
             if (q.get('ref')) h.Referer = q.get('ref');
@@ -682,6 +689,7 @@ const server = http.createServer(async (req, res) => {
         } catch (e) { return send(res, 200, { error: e.message }); }
     }
     // veev test: /debug/veev?url=https://veev.to/e/<code>
+    if ((url === '/debug/veev' || url === '/debug/byse' || url.startsWith('/debug/sto')) && !adminOk(new URL(req.url, 'http://x').searchParams)) return send(res, 403, { error: 'wrong token' });
     if (url === '/debug/veev') {
         const target = new URL(req.url, 'http://x').searchParams.get('url') || '';
         const steps = [];
@@ -759,7 +767,7 @@ const server = http.createServer(async (req, res) => {
     // set the TMDB key from a browser: /setkey?token=<RELAY_TOKEN>&key=<TMDB key>
     if (url === '/setkey') {
         const q = new URL(req.url, 'http://x').searchParams;
-        if (!RELAY_TOKEN || q.get('token') !== RELAY_TOKEN) return send(res, 403, { error: 'wrong token' });
+        if (!adminOk(q)) return send(res, 403, { error: 'wrong token' });
         const k = (q.get('key') || '').trim();
         const ok = k && (await fetch(`https://api.themoviedb.org/3/configuration?api_key=${encodeURIComponent(k)}`).then(r => r.ok, () => false));
         if (!ok) return send(res, 400, { error: 'TMDB did not accept that key' });
@@ -768,7 +776,7 @@ const server = http.createServer(async (req, res) => {
         return send(res, 200, { ok: true, tmdbKey: true });
     }
     if (url === '/relay/config') {
-        if (!RELAY_TOKEN || q.get('token') !== RELAY_TOKEN) return send(res, 403, { error: 'wrong token' });
+        if (!adminOk(q)) return send(res, 403, { error: 'wrong token' });
         return res.writeHead(200, { 'Content-Type': 'application/json' }), res.end(JSON.stringify({ tmdbKey: TMDB_API_KEY }));
     }
 
