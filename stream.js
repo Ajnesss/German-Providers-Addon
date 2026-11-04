@@ -105,6 +105,7 @@ async function rewritePlaylist(text, baseUrl, base, headers, route, force) {
 let refresher = null;
 async function tryRefresh(job, res) {
     if (!refresher || !job.re || job.f) return false;
+    if (res.req && res.req.headers['x-gpa-check']) return false;   // the server's own link check: report, don't repair
     const fresh = await refresher(job.re, job.u).catch(() => null);
     note({ refresh: job.re.slice(0, 4).join(' '), result: fresh ? 'new link' : 'none found' });
     if (!fresh) return false;

@@ -78,6 +78,9 @@ function loadPlugin(file) {
     // Filemoon moved to a new player ("Byse"); the plugins' old reader finds nothing there any more
     if (process.env.BYSE !== '0' && code.includes('[filemoon, ["filemoon"]]'))
         code = `var __byse = require(${JSON.stringify(path.join(__dirname, 'byse.js'))});\n` + code.replace('[filemoon, ["filemoon"]]', '[__byse.forPlugins, ["filemoon", "byse", "bysekoze"]]');
+    // Huhu moved to the open mHub v2 protocol: its old endpoint is gone, the plugin asks the new one instead
+    if (process.env.HUHU_V2 !== '0' && code.includes('mediaurl-source.json') && /^function sources\(/m.test(code))
+        code += require('./huhu-v2.js').PATCH;
     const m = new Module(file, module);
     m.filename = file;
     m.paths = Module._nodeModulePaths(path.dirname(file));
@@ -359,7 +362,7 @@ async function lookup(type, id) {
         // late providers still finish in the background; refresh the cache with the full list for the next request
         Promise.all(runs).then(() => {
             const key = `${type}:${id}`;
-            if (results.length > snapshot.length) cache.set(key, { time: Date.now(), ttl: CACHE_MIN * 60000, promise: Promise.resolve(sortStreams(results)) });
+            if (results.length > snapshot.length) { const full = sortStreams(results); const e2 = { time: Date.now(), ttl: CACHE_MIN * 60000, promise: Promise.resolve(full) }; cache.set(key, e2); verifyLater(key, e2, full); }
         });
     }
     return sortStreams(snapshot);
@@ -420,6 +423,33 @@ passthrough.setRefresher(async ([type, id, prov, host], failedUrl) => {
     return passthrough.markFresh(pick.url);
 });
 
+// After answering, try every link like the player would (a few KB each, in the background) and move links that
+// don't start to the end of the cached list. The next request for this episode (autoplay, the prefetched next
+// episode, a second device) then starts with links known to work. VERIFY=0 turns it off.
+const VERIFY = process.env.VERIFY !== '0';
+const VERIFY_MAX = Number(process.env.VERIFY_MAX) || 10;
+let verifying = 0;
+const verifyQueue = [];
+function verifySlot() { return verifying < 3 ? Promise.resolve(verifying++) : new Promise(r => verifyQueue.push(r)).then(() => verifying++); }
+function verifyDone() { verifying--; const next = verifyQueue.shift(); if (next) next(); }
+const verifyStats = { checked: 0, failed: 0 };
+function verifyLater(key, entry, streams) {
+    if (!VERIFY || streams.length < 2) return;
+    setTimeout(async () => {
+        const results = await Promise.all(streams.slice(0, VERIFY_MAX).map(async st => {
+            await verifySlot();
+            try { return /^OK/.test(await playCheck(st)); } catch (e) { return false; } finally { verifyDone(); }
+        }));
+        verifyStats.checked += results.length;
+        const dead = new Set(streams.slice(0, VERIFY_MAX).filter((st, i) => !results[i]));
+        verifyStats.failed += dead.size;
+        if (!dead.size || dead.size === Math.min(streams.length, VERIFY_MAX)) return;   // all failed: probably us, not them
+        const ordered = streams.filter(st => !dead.has(st)).concat(streams.filter(st => dead.has(st)));
+        if (cache.get(key) === entry) entry.promise = Promise.resolve(ordered);
+        log(`  checked ${key}: ${dead.size} of ${results.length} links don't start, moved to the end`);
+    }, 3000).unref();
+}
+
 function getStreams(type, id, prefetched) {
     const key = `${type}:${id}`;
     const hit = cache.get(key);
@@ -427,6 +457,7 @@ function getStreams(type, id, prefetched) {
     const promise = lookup(type, id).then(streams => {
         // nothing found: only remember that briefly
         entry.ttl = (streams.length ? (prefetched ? PREFETCH_MIN : CACHE_MIN) : 2) * 60000;
+        verifyLater(key, entry, streams);
         return streams;
     }, err => { cache.delete(key); throw err; });
     const entry = { time: Date.now(), ttl: TIMEOUT_MS + 60000, promise };
@@ -467,21 +498,21 @@ const AUDIT_TITLES = (process.env.AUDIT_TITLES ||
 
 // play a stream like the player would: playlist -> first quality -> first video piece (first 2 KB only)
 async function playCheck(stream) {
-    const local = publicBase ? stream.url.replace(publicBase, `http://127.0.0.1:${PORT}`) : stream.url;
+    const local = publicBase ? stream.url.replace(publicBase, `http://127.0.0.1:${(server.address() || {}).port || PORT}`) : stream.url;
     const headers = Object.assign({}, ((stream.behaviorHints || {}).proxyHeaders || {}).request);
     let url = local;
     for (let depth = 0; depth < 4; depth++) {
-        const r = await fetch(url, { headers: Object.assign({ 'User-Agent': 'ExoPlayer' }, headers, { Range: 'bytes=0-2047' }), signal: AbortSignal.timeout(20000) });
+        const r = await fetch(url, { headers: Object.assign({ 'User-Agent': 'ExoPlayer', 'X-Gpa-Check': '1' }, headers, { Range: 'bytes=0-2047' }), signal: AbortSignal.timeout(20000) });
         const type = r.headers.get('content-type') || '';
         const buf = Buffer.from(await r.arrayBuffer());
         const head = buf.toString('utf8', 0, 300);
         if (r.status >= 400) return `FAIL ${r.status} at ${depth ? 'playlist/piece' : 'start'}${r.status === 502 ? ' (' + buf.toString('utf8', 0, 200) + ')' : ''}`;
         if (/^#EXTM3U/.test(head.trim())) {
-            const text = buf.length >= 2048 ? await (await fetch(url, { headers: Object.assign({ 'User-Agent': 'ExoPlayer' }, headers), signal: AbortSignal.timeout(20000) })).text() : buf.toString('utf8');
+            const text = buf.length >= 2048 ? await (await fetch(url, { headers: Object.assign({ 'User-Agent': 'ExoPlayer', 'X-Gpa-Check': '1' }, headers), signal: AbortSignal.timeout(20000) })).text() : buf.toString('utf8');
             const next = text.split(/\r?\n/).map(l => l.trim()).find(l => l && !l.startsWith('#'));
             if (!next) return 'FAIL empty playlist';
             url = new URL(next, r.url || url).toString();
-            if (publicBase) url = url.replace(publicBase, `http://127.0.0.1:${PORT}`);
+            if (publicBase) url = url.replace(publicBase, `http://127.0.0.1:${(server.address() || {}).port || PORT}`);
             continue;
         }
         if (/html/i.test(type) || /^\s*</.test(head)) return `FAIL got a web page (${r.status})`;
@@ -560,7 +591,7 @@ async function runAudit(audit) {
 function addonManifest() {
     return {
         id: 'community.german-providers.addon',
-        version: '1.6.2',
+        version: '1.7.0',
         name: 'German Providers',
         description: `Deutsche Quellen (s.to, AniWorld, ARD, Arte, FilmPalast …) als Addon. Plugins v${pluginVersion} von InvalidPandaa/nuvio-german-providers (GPL-3.0).`,
         logo: publicBase ? `${publicBase}/logo.png` : 'https://flagcdn.com/w160/de.png',
@@ -596,7 +627,7 @@ const server = http.createServer(async (req, res) => {
         if (!providers.length) problems.push('no providers loaded');
         if (process.env.WARP !== '0' && warpDownSince && Date.now() - warpDownSince > 30 * 60000) problems.push('WARP down for over 30 minutes');
         const paused = providers.filter(p => p.pausedUntil > Date.now()).map(p => p.id);
-        return send(res, problems.length ? 503 : 200, { ok: !problems.length, problems, warp: net.warpOn(), addon: `${req.headers['x-forwarded-proto'] || 'http'}://${req.headers.host}/manifest.json`, plugins: pluginVersion, providers: providers.map(p => p.id), paused, tmdbKey: !!TMDB_API_KEY, tmdbKeyStatus: keyStatus });
+        return send(res, problems.length ? 503 : 200, { ok: !problems.length, problems, warp: net.warpOn(), addon: `${req.headers['x-forwarded-proto'] || 'http'}://${req.headers.host}/manifest.json`, plugins: pluginVersion, providers: providers.map(p => p.id), paused, tmdbKey: !!TMDB_API_KEY, tmdbKeyStatus: keyStatus, linkChecks: verifyStats, downHosts: net.status().down });
     }
     if (url === '/logo.png') {
         try {

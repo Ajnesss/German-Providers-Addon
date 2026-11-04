@@ -118,10 +118,29 @@ function toResponse(r) {
     return out;
 }
 
+// hosts that just hung for many seconds and then failed (Cloudflare 52x "origin down", timeouts): for a few minutes
+// answer at once instead of waiting again, so one dead video host doesn't hold a whole site's results for 20 s
+const DOWN_MS = Number(process.env.DOWN_HOST_MS) || 10 * 60000;
+const SLOW_FAIL_MS = 5000;
+const down = new Map();   // host -> until
+const NEVER_DOWN = /themoviedb\.org|ardmediathek|zdf\.de|arte\.tv|huhu\.to|cloudflare/i;   // lookups everything depends on
+function markDown(host, ms) {
+    if (ms < SLOW_FAIL_MS || NEVER_DOWN.test(host)) return;
+    down.set(host, Date.now() + DOWN_MS);
+    if (down.size > 500) down.delete(down.keys().next().value);
+}
+
 async function smartFetch(input, opts = {}) {
     const url = typeof input === 'string' ? input : (input && input.url) || String(input);
     if (!/^https?:/i.test(url)) return nativeFetch(input, opts);
     const host = hostOf(url);
+    if ((down.get(host) || 0) > Date.now()) {
+        trace({ url, route: 'skip', status: 522, ms: 0, snippet: 'host down a moment ago, not waiting again' });
+        const out = new Response('host down', { status: 522, statusText: 'host down (remembered)' });
+        Object.defineProperty(out, 'url', { value: url });
+        return out;
+    }
+    const started = Date.now();
     const h = plainHeaders(opts.headers);
     const uaKey = Object.keys(h).find(k => k.toLowerCase() === 'user-agent');
     const browserLike = !uaKey || /Mozilla/i.test(h[uaKey]);
@@ -141,6 +160,7 @@ async function smartFetch(input, opts = {}) {
             if (blocked) { count(host, route, 'blocked'); sawBlock = true; last = r; continue; }
             // after a block, a 404 is often a fake "not found" for servers: try the remaining routes too
             if (r.status === 404 && sawBlock) { count(host, route, 'blocked'); candidate = candidate || r; continue; }
+            if (r.status >= 520 && r.status <= 526) markDown(host, Date.now() - started);
             count(host, route, 'ok');
             if (route !== 'node') memory.set(host, { route, until: Date.now() + REMEMBER_MS });
             else if (mem) memory.delete(host);
@@ -150,7 +170,7 @@ async function smartFetch(input, opts = {}) {
             count(host, route, 'error');
             lastErr = e;
             // a slow site stays slow on every route: don't spend another 20 s per route on it
-            if (isTimeout(e) && !sawBlock) break;
+            if (isTimeout(e) && !sawBlock) { markDown(host, Date.now() - started); break; }
         }
     }
     // a host that blocks every route: hosts like DoodStream run mirror domains with the same files, try those
@@ -262,4 +282,4 @@ const availableRoutes = () => ['node', 'direct'].concat(warpUp ? ['warp'] : [], 
 const ipOf = route => (route === 'node' || route === 'direct') ? 'server' : route;
 function warpLog() { try { return require('fs').readFileSync('/tmp/warp.log', 'utf8').split('\n').filter(Boolean).slice(-25); } catch (e) { return ['no warp log']; } }
 
-module.exports = { hasCookie: url => !!cookieHeader(url), rememberedRoute: host => { const m = memory.get(host); return m && m.until > Date.now() ? m.route : null; }, open, availableRoutes, peek, probe: (route, url, opts) => once(route, url, opts || {}, true), warpOn: () => warpUp, traceStore, smartFetch, nativeFetch, startWarpWatch, checkWarp, diag, ipOf, status: () => ({ warp: warpUp, warpLog: warpLog(), proxy: !!PROXY_URL, remembered: Object.fromEntries([...memory].map(([h, m]) => [h, m.route])), stats }) };
+module.exports = { hasCookie: url => !!cookieHeader(url), rememberedRoute: host => { const m = memory.get(host); return m && m.until > Date.now() ? m.route : null; }, open, availableRoutes, peek, probe: (route, url, opts) => once(route, url, opts || {}, true), warpOn: () => warpUp, traceStore, smartFetch, nativeFetch, startWarpWatch, checkWarp, diag, ipOf, status: () => ({ down: Object.fromEntries([...down].filter(([, t]) => t > Date.now()).map(([h, t]) => [h, new Date(t).toISOString()])), warp: warpUp, warpLog: warpLog(), proxy: !!PROXY_URL, remembered: Object.fromEntries([...memory].map(([h, m]) => [h, m.route])), stats }) };
