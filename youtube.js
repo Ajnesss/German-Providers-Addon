@@ -62,7 +62,13 @@ async function uploads(channelId) {
         const list = [];
         let page = '';
         for (let i = 0; i < MAX_PAGES; i++) {
-            const d = await fetchJson(`${API}/playlistItems?part=snippet,contentDetails&maxResults=50&playlistId=UU${channelId.slice(2)}${page ? '&pageToken=' + page : ''}&key=${KEY}`);
+            let d;
+            try {
+                d = await fetchJson(`${API}/playlistItems?part=snippet,contentDetails&maxResults=50&playlistId=UU${channelId.slice(2)}${page ? '&pageToken=' + page : ''}&key=${KEY}`);
+            } catch (e) {
+                if (/ 404:/.test(e.message)) break;                       // a channel without public uploads
+                throw e;
+            }
             for (const it of d.items || []) list.push({ id: (it.contentDetails || {}).videoId, title: (it.snippet || {}).title || '' });
             page = d.nextPageToken;
             if (!page) break;

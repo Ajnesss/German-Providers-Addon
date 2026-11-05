@@ -356,7 +356,7 @@ async function lookup(type, id) {
     const started = Date.now();
     const runs = active.map((p, order) => runProvider(p, tmdbId, pType, season, episode)
         .then(list => {
-            (list || []).forEach((st, i) => results.push(Object.assign(toAddonStream(st, p, ctx), { order, i, pref: prefIndex(p.id), provider: p.id })));
+            (list || []).filter(st => st && (st.ytId || /^https?:\/\//i.test(st.url || ''))).forEach((st, i) => results.push(Object.assign(toAddonStream(st, p, ctx), { order, i, pref: prefIndex(p.id), provider: p.id })));   // a host's error word ("RELOAD") is no link
             log(`  ${p.id}: ${(list || []).length} streams in ${Date.now() - started} ms`);
         })
         .catch(err => log(`  ${p.id}: error ${err.message}`)));
@@ -630,7 +630,7 @@ async function runAudit(audit) {
 function addonManifest() {
     return {
         id: 'community.german-providers.addon',
-        version: '1.9.0',
+        version: '1.9.1',
         name: 'German Providers',
         description: `Deutsche Quellen (s.to, AniWorld, ARD, Arte, FilmPalast …) als Addon. Plugins v${pluginVersion} von InvalidPandaa/nuvio-german-providers (GPL-3.0).`,
         logo: publicBase ? `${publicBase}/logo.png` : 'https://flagcdn.com/w160/de.png',

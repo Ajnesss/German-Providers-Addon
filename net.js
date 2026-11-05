@@ -164,6 +164,13 @@ async function smartFetch(input, opts = {}) {
             count(host, route, 'ok');
             if (route !== 'node') memory.set(host, { route, until: Date.now() + REMEMBER_MS });
             else if (mem) memory.delete(host);
+            // redirected to another domain (dood.to -> playmogo.com): the next requests there must leave from the same
+            // address, video hosts hand out links that only work for the address that opened the page
+            const finalHost = hostOf(r.url || url);
+            if (finalHost !== host && finalHost !== '?') {
+                if (route !== 'node') memory.set(finalHost, { route, until: Date.now() + REMEMBER_MS });
+                else memory.delete(finalHost);
+            }
             return toResponse(r);
         } catch (e) {
             trace({ url, route, error: String(e.message || e).slice(0, 120), ms: Date.now() - t });
