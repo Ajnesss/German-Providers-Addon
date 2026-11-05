@@ -116,6 +116,9 @@ function loadFrom(dir) {
     // built in (not one of the plugins): ARD daily soaps such as "Sturm der Liebe", matched by broadcast date
     if (!SKIP.includes('ardsoap') && (!ONLY.length || ONLY.includes('ardsoap')))
         list.push({ id: 'ardsoap', name: 'ARD', types: ['tv'], mod: ard, lock: Promise.resolve() });
+    // built in: full episodes on a series' official German YouTube channel (played by Nuvio's own YouTube player)
+    if (!SKIP.includes('youtube') && (!ONLY.length || ONLY.includes('youtube')))
+        list.push({ id: 'youtube', name: 'YouTube', types: ['tv'], mod: require('./youtube.js'), lock: Promise.resolve() });
     // built in: ZDF, 3sat, KiKA & the other public broadcasters' Mediatheken (films and series), via MediathekViewWeb
     if (!SKIP.includes('mediathek') && (!ONLY.length || ONLY.includes('mediathek')))
         list.push({ id: 'mediathek', name: 'Mediathek', types: ['movie', 'tv'], mod: require('./mvw.js'), lock: Promise.resolve() });
@@ -240,6 +243,19 @@ function toAddonStream(s, provider, ctx) {
     const lang = parts[1] || 'Deutsch';
     const key = LANG_KEY(lang);
     const quality = s.quality || 'auto';
+    if (s.ytId) {
+        // YouTube: no file address, the app plays the video id in its own YouTube player
+        const meta = (ctx && ctx.meta) || {};
+        const head = meta.title ? (ctx.season != null ? `${meta.title} S${pad2(ctx.season)} ･ E${pad2(ctx.episode)}` : meta.title) : '';
+        const out = {
+            name: RES_LABEL('auto'),
+            title: [head, `▫ ${parts[0]}${parts[2] ? ' · ' + parts[2] : ''}`, `▫ ${key === 'de' ? '🇩🇪 German' : '🌐 ' + (LANG_EN[lang] || lang)}`].filter(Boolean).join('\n'),
+            ytId: s.ytId,
+            behaviorHints: { bingeGroup: `german-providers-${provider.id}-${key}`, filename: releaseName(meta, ctx, 'auto', s, key, lang, parts[0], parts[2] || 'YouTube') },
+        };
+        out.description = out.title;
+        return { rank: RANK[key], q: 2, label: parts.join(' '), stream: out };
+    }
     let headers = s.headers && Object.keys(s.headers).length ? s.headers : null;
     let url = s.url;
     // hosts like VOE only play on the connection that found the link: pass those through this server
@@ -382,7 +398,7 @@ async function lookup(type, id) {
 }
 
 // provider order in the list (within each language group): dedicated streaming sites first, loose matchers last
-const PREFERRED = (process.env.PROVIDER_ORDER || 'serienstream,aniworld,huhuto,moflix,filmpalast,megakino,kinoking,hdfilme,filmo,kellerkino,flixitv,filmfrei24,mediathek,ard,arte,dmax,tele5,tlc,southpark,netzkino,plutotv')
+const PREFERRED = (process.env.PROVIDER_ORDER || 'serienstream,aniworld,huhuto,moflix,filmpalast,megakino,kinoking,hdfilme,filmo,kellerkino,flixitv,filmfrei24,mediathek,ard,arte,youtube,dmax,tele5,tlc,southpark,netzkino,plutotv')
     .split(',').map(x => x.trim());
 const prefIndex = id => { const i = PREFERRED.indexOf(id); return i < 0 ? PREFERRED.length : i; };
 const DEMOTE = new RegExp(process.env.DEMOTE_HOSTS || 'supervideo|dropload|dr0pstream|moflix-stream\\.click', 'i');
@@ -392,6 +408,7 @@ const KEEP_GERMAN_SUBS = process.env.GERMAN_SUBS === '1';       // set GERMAN_SU
 const MAX_PER_HOST = Number(process.env.MAX_PER_HOST) || 2;        // streams kept per site + host + language
 // the real video address behind a stream (pass-through links carry it inside), without the changing ?token part
 function videoKey(st) {
+    if (st.ytId) return 'youtube/' + st.ytId;
     const job = passthrough.jobOf(st.url);
     const u = (job && job.u) || st.url || '';
     try { const x = new URL(u); return x.host + x.pathname; } catch (e) { return u.split('?')[0]; }
@@ -460,7 +477,7 @@ function verifyLater(key, entry, streams) {
     setTimeout(async () => {
         const results = await Promise.all(streams.slice(0, VERIFY_MAX).map(async st => {
             await verifySlot();
-            try { return /^OK/.test(await playCheck(st)); } catch (e) { return false; } finally { verifyDone(); }
+            try { return st.ytId ? true : /^OK/.test(await playCheck(st)); } catch (e) { return false; } finally { verifyDone(); }
         }));
         verifyStats.checked += results.length;
         const dead = new Set(streams.slice(0, VERIFY_MAX).filter((st, i) => !results[i]));
@@ -613,7 +630,7 @@ async function runAudit(audit) {
 function addonManifest() {
     return {
         id: 'community.german-providers.addon',
-        version: '1.8.1',
+        version: '1.9.0',
         name: 'German Providers',
         description: `Deutsche Quellen (s.to, AniWorld, ARD, Arte, FilmPalast …) als Addon. Plugins v${pluginVersion} von InvalidPandaa/nuvio-german-providers (GPL-3.0).`,
         logo: publicBase ? `${publicBase}/logo.png` : 'https://flagcdn.com/w160/de.png',
