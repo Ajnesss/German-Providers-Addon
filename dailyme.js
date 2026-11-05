@@ -44,7 +44,8 @@ async function getStreams(tmdbId, type, season, episode) {
             const year = Number(String(d.release_date || '').slice(0, 4));
             const runtime = Number(d.runtime) || 0;
             // a western whose German title matches, from the same year, of about the same length
-            const f = cat.western.find(x => names.includes(norm(x.t)) && (!year || !x.j || Math.abs(Number(x.j) - year) <= 1)
+            const main = t => norm(String(t || '').split(/\s[-–]\s/)[0]);   // "Johnny Guitar - Gejagt, gehaßt, gefürchtet" -> "johnny guitar"
+            const f = cat.western.find(x => (names.includes(norm(x.t)) || names.includes(main(x.t)) || names.map(main).includes(main(x.t))) && (!year || !x.j || Math.abs(Number(x.j) - year) <= 1)
                 && (!runtime || !x.m || Math.abs(runtime - x.m) <= Math.max(12, runtime * 0.25)));
             if (f) return [{ name: 'dailyme · Deutsch · Western', title: `${f.t} (${f.j || ''})`, url: `https://mini-cms.daygent.de/film/play/${encodeURIComponent(f.id)}.m3u8`, quality: 'auto' }];
             // single DDR TV films are listed as a "series" with one part
