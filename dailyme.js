@@ -11,14 +11,16 @@ const UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML,
 let lists = null;   // { time, western: [...], ddr: [...] }
 
 async function json(path) {
-    const r = await fetch(BASE + path, { headers: { 'User-Agent': UA, Accept: 'application/json' }, signal: AbortSignal.timeout(20000) });
+    const r = await fetch(BASE + path, { headers: { 'User-Agent': UA, Accept: 'application/json' }, signal: AbortSignal.timeout(30000) });
     if (!r.ok) throw new Error(`${path} HTTP ${r.status}`);
     return r.json();
 }
 async function catalogue() {
-    if (lists && Date.now() - lists.time < 6 * 3600 * 1000) return lists;
-    const [w, d] = await Promise.all([json('/fast/western.json').catch(() => ({})), json('/fast/ddr.json').catch(() => ({}))]);
-    lists = { time: Date.now(), western: w.filme || [], ddr: d.serien || [] };
+    // a list that failed to load is only remembered for 5 minutes, a good one for 6 hours
+    if (lists && Date.now() - lists.time < (lists.western.length && lists.ddr.length ? 6 * 3600 * 1000 : 5 * 60000)) return lists;
+    const [w, d] = await Promise.all([json('/fast/western.json').catch(e => { console.error(`[dailyme] ${e.message}`); return {}; }),
+        json('/fast/ddr.json').catch(e => { console.error(`[dailyme] ${e.message}`); return {}; })]);
+    lists = { time: Date.now(), western: w.filme || (lists && lists.western) || [], ddr: d.serien || (lists && lists.ddr) || [] };
     return lists;
 }
 const norm = s => String(s || '').toLowerCase().normalize('NFD').replace(/[̀-ͯ]/g, '').replace(/ß/g, 'ss')
