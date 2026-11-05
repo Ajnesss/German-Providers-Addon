@@ -652,7 +652,7 @@ async function runAudit(audit) {
 function addonManifest() {
     return {
         id: 'community.german-providers.addon',
-        version: '1.12.0',
+        version: '1.12.1',
         name: 'German Providers',
         description: `Deutsche Quellen (s.to, AniWorld, ARD, Arte, FilmPalast …) als Addon. Plugins v${pluginVersion} von InvalidPandaa/nuvio-german-providers (GPL-3.0).`,
         logo: publicBase ? `${publicBase}/logo.png` : 'https://flagcdn.com/w160/de.png',
@@ -735,7 +735,7 @@ const server = http.createServer(async (req, res) => {
         try {
             const ep = 'https://serienstream.to/serie/merlin-die-neuen-abenteuer/staffel-1/episode-3';
             const html = await (await net.smartFetch(ep, { headers: { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36' } })).text();
-            test.loggedIn = !/href="\/login"/.test(html);
+            test.loggedIn = /logout|abmelden/i.test(html) || !/href="\/login"/.test(html);
             test.gate = (html.match(/data-redirect-gate-tier="([^"]*)"/) || [])[1] || 'none';
             const play = (html.match(/data-play-url="([^"]+)"[^>]*data-language-id="1"|data-language-id="1"[^>]*data-play-url="([^"]+)"/) || []).slice(1).find(Boolean);
             if (play) {
@@ -745,7 +745,8 @@ const server = http.createServer(async (req, res) => {
             }
         } catch (e) { test.error = e.message; }
         for (const k of [...cache.keys()]) if (k.startsWith('series:')) cache.delete(k);
-        const ok = test.loggedIn && test.hosterLink;
+        const ok = !!test.hosterLink;   // the real proof: a German hoster button leads straight to the hoster
+        if (ok) test.loggedIn = true;
         res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-store' });
         return res.end(`<!doctype html><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>SerienStream login</title>
 <style>body{font:16px system-ui,sans-serif;max-width:720px;margin:32px auto;padding:0 16px;background:#14171c;color:#e8e8e8}textarea{width:100%;box-sizing:border-box;background:#1f242c;color:#fff;border:1px solid #444;border-radius:6px;padding:10px;font:13px monospace}</style>
