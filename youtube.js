@@ -13,6 +13,9 @@
 const KEY = (process.env.YT_API_KEY || 'AIzaSyBMufKaUnMoKQbd9j4Lj3DeEvLMe7caUBU').trim();
 const API = process.env.YT_API || 'https://www.googleapis.com/youtube/v3';
 const MAX_PAGES = Number(process.env.YT_MAX_PAGES) || 30;          // 50 videos per page
+// Nuvio plays YouTube videos on the TV itself, so a video has to be allowed in the viewer's country. Many German
+// channels (TOGGO, ...) only allow Germany/Austria/Switzerland: those are left out for a viewer elsewhere.
+const REGION = (process.env.YT_REGION || 'GB').toUpperCase();
 const OFFICIAL = /deutsch|offiziell|german|toggo|kika|super ?rtl|nick(elodeon)? (de|deutschland)|disney (junior|channel) (de|deutschland)/i;
 const NOT_EPISODE = /trailer|teaser|clip|ausschnitt|#shorts|\bshorts\b|making.?of|best of|zusammenschnitt|compilation|marathon|\b\d+\s*(stunden?|std)\b|eine stunde|\b\d+\s*min(uten)?\b|folgen am st(ü|ue)ck/i;
 
@@ -67,8 +70,14 @@ async function uploads(channelId) {
         for (let i = 0; i < list.length; i += 50) {
             const part = list.slice(i, i + 50);
             const d = await fetchJson(`${API}/videos?part=contentDetails&id=${part.map(v => v.id).join(',')}&key=${KEY}`);
-            const len = new Map((d.items || []).map(v => [v.id, seconds((v.contentDetails || {}).duration)]));
-            part.forEach(v => { v.sec = len.get(v.id) || 0; });
+            const info = new Map((d.items || []).map(v => [v.id, v.contentDetails || {}]));
+            part.forEach(v => {
+                const c = info.get(v.id) || {};
+                const r = c.regionRestriction || {};
+                v.sec = seconds(c.duration);
+                v.allowed = r.allowed || null;
+                v.blocked = r.blocked || null;
+            });
         }
         return list.filter(v => v.id && v.sec);
     });
@@ -80,10 +89,11 @@ async function tmdb(path) {
     return r.json();
 }
 
+const playableHere = v => (!v.allowed || v.allowed.includes(REGION)) && !(v.blocked || []).includes(REGION);
 function pick(videos, epName, runtimeMin) {
     const rt = (runtimeMin || 0) * 60;
     const fits = v => !rt || (v.sec >= rt * 0.6 && v.sec <= Math.max(rt * 2.5, 30 * 60));
-    return videos.filter(v => has(v.title, epName) && !NOT_EPISODE.test(v.title) && fits(v))
+    return videos.filter(v => has(v.title, epName) && !NOT_EPISODE.test(v.title) && fits(v) && playableHere(v))
         .sort((a, b) => a.sec - b.sec)[0] || null;
 }
 
@@ -106,4 +116,4 @@ async function getStreams(tmdbId, type, season, episode) {
     }
 }
 
-module.exports = { getStreams, pick, seconds, norm, has };
+module.exports = { getStreams, pick, seconds, norm, has, playableHere };
