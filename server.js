@@ -121,6 +121,11 @@ function loadFrom(dir) {
     // built in: SerienStream episodes opened in the TV's browser (the viewer passes s.to's check there)
     if (process.env.STO_BROWSER === '1' && !SKIP.includes('stobrowser') && (!ONLY.length || ONLY.includes('stobrowser')))
         list.push({ id: 'stobrowser', name: 'SerienStream', types: ['tv'], mod: require('./sto-browser.js'), lock: Promise.resolve() });
+    // built in: wedotv (free films & series, German versions) and dailyme TV's open catalogue (westerns, DDR TV archive)
+    if (!SKIP.includes('wedotv') && (!ONLY.length || ONLY.includes('wedotv')))
+        list.push({ id: 'wedotv', name: 'wedotv', types: ['movie', 'tv'], mod: require('./wedotv.js'), lock: Promise.resolve() });
+    if (!SKIP.includes('dailyme') && (!ONLY.length || ONLY.includes('dailyme')))
+        list.push({ id: 'dailyme', name: 'dailyme', types: ['movie', 'tv'], mod: require('./dailyme.js'), lock: Promise.resolve() });
     // built in: full episodes on a series' official German YouTube channel (played by Nuvio's own YouTube player)
     if (!SKIP.includes('youtube') && (!ONLY.length || ONLY.includes('youtube')))
         list.push({ id: 'youtube', name: 'YouTube', types: ['tv'], mod: require('./youtube.js'), lock: Promise.resolve() });
@@ -233,7 +238,7 @@ async function showMeta(pType, tmdbId) {
 }
 
 // always through the Frankfurt server, even when the host would allow direct play (Germany-only broadcasters)
-const FORCE_THROUGH = ['ardsoap', 'mediathek'];
+const FORCE_THROUGH = ['ardsoap', 'mediathek', 'wedotv', 'dailyme'];
 function releaseName(meta, ctx, quality, s, key, lang, site, host) {
     const clean = t => String(t || '').normalize('NFD').replace(/[\u0300-\u036f]/g, '').replace(/ß/g, 'ss').replace(/[^A-Za-z0-9]+/g, '.').replace(/^\.+|\.+$/g, '');
     const qtext = `${quality} ${s.name || ''} ${s.title || ''}`;
@@ -416,7 +421,7 @@ async function lookup(type, id) {
 }
 
 // provider order in the list (within each language group): dedicated streaming sites first, loose matchers last
-const PREFERRED = (process.env.PROVIDER_ORDER || 'serienstream,aniworld,huhuto,moflix,filmpalast,megakino,kinoking,hdfilme,filmo,kellerkino,flixitv,filmfrei24,mediathek,ard,arte,youtube,stobrowser,dmax,tele5,tlc,southpark,netzkino,plutotv')
+const PREFERRED = (process.env.PROVIDER_ORDER || 'serienstream,aniworld,huhuto,moflix,filmpalast,megakino,kinoking,hdfilme,filmo,kellerkino,flixitv,filmfrei24,mediathek,wedotv,dailyme,ard,arte,youtube,stobrowser,dmax,tele5,tlc,southpark,netzkino,plutotv')
     .split(',').map(x => x.trim());
 const prefIndex = id => { const i = PREFERRED.indexOf(id); return i < 0 ? PREFERRED.length : i; };
 const DEMOTE = new RegExp(process.env.DEMOTE_HOSTS || 'supervideo|dropload|dr0pstream|moflix-stream\\.click', 'i');
@@ -652,7 +657,7 @@ async function runAudit(audit) {
 function addonManifest() {
     return {
         id: 'community.german-providers.addon',
-        version: '1.12.1',
+        version: '1.13.0',
         name: 'German Providers',
         description: `Deutsche Quellen (s.to, AniWorld, ARD, Arte, FilmPalast …) als Addon. Plugins v${pluginVersion} von InvalidPandaa/nuvio-german-providers (GPL-3.0).`,
         logo: publicBase ? `${publicBase}/logo.png` : 'https://flagcdn.com/w160/de.png',
