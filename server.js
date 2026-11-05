@@ -88,6 +88,8 @@ function loadPlugin(file) {
     // Huhu moved to the open mHub v2 protocol: its old endpoint is gone, the plugin asks the new one instead
     if (process.env.HUHU_V2 !== '0' && code.includes('mediaurl-source.json') && /^function sources\(/m.test(code))
         code += require('./huhu-v2.js').PATCH;
+    // let the SerienStream hand-off use the plugins' host readers (VOE, Dood, Filemoon, ...)
+    if (/^function resolveEmbed\(/m.test(code)) code += '\n;try { module.exports.__resolveEmbed = resolveEmbed; } catch (e) {}\n';
     const m = new Module(file, module);
     m.filename = file;
     m.paths = Module._nodeModulePaths(path.dirname(file));
@@ -116,6 +118,9 @@ function loadFrom(dir) {
     // built in (not one of the plugins): ARD daily soaps such as "Sturm der Liebe", matched by broadcast date
     if (!SKIP.includes('ardsoap') && (!ONLY.length || ONLY.includes('ardsoap')))
         list.push({ id: 'ardsoap', name: 'ARD', types: ['tv'], mod: ard, lock: Promise.resolve() });
+    // built in: SerienStream episodes opened in the TV's browser (the viewer passes s.to's check there)
+    if (process.env.STO_BROWSER === '1' && !SKIP.includes('stobrowser') && (!ONLY.length || ONLY.includes('stobrowser')))
+        list.push({ id: 'stobrowser', name: 'SerienStream', types: ['tv'], mod: require('./sto-browser.js'), lock: Promise.resolve() });
     // built in: full episodes on a series' official German YouTube channel (played by Nuvio's own YouTube player)
     if (!SKIP.includes('youtube') && (!ONLY.length || ONLY.includes('youtube')))
         list.push({ id: 'youtube', name: 'YouTube', types: ['tv'], mod: require('./youtube.js'), lock: Promise.resolve() });
@@ -243,6 +248,19 @@ function toAddonStream(s, provider, ctx) {
     const lang = parts[1] || 'Deutsch';
     const key = LANG_KEY(lang);
     const quality = s.quality || 'auto';
+    if (s.externalUrl) {
+        // opens in the TV's browser (SerienStream: the viewer passes the site's check there and watches in the browser)
+        const meta = (ctx && ctx.meta) || {};
+        const head = meta.title && ctx.season != null ? `${meta.title} S${pad2(ctx.season)} ･ E${pad2(ctx.episode)}` : (meta.title || '');
+        const out = {
+            name: '𝗕𝗿𝗼𝘄𝘀𝗲𝗿',
+            title: [head, `▫ ${parts[0]} · ${s.title || 'im Browser'}`, `▫ 🇩🇪 German · öffnet den Browser`].filter(Boolean).join('\n'),
+            externalUrl: s.externalUrl,
+            behaviorHints: { bingeGroup: `german-providers-${provider.id}-${key}` },
+        };
+        out.description = out.title;
+        return { rank: RANK[key], q: 0, label: parts.join(' '), stream: out, external: true };
+    }
     if (s.ytId) {
         // YouTube: no file address, the app plays the video id in its own YouTube player
         const meta = (ctx && ctx.meta) || {};
@@ -356,7 +374,7 @@ async function lookup(type, id) {
     const started = Date.now();
     const runs = active.map((p, order) => runProvider(p, tmdbId, pType, season, episode)
         .then(list => {
-            (list || []).filter(st => st && (st.ytId || /^https?:\/\//i.test(st.url || ''))).forEach((st, i) => results.push(Object.assign(toAddonStream(st, p, ctx), { order, i, pref: prefIndex(p.id), provider: p.id })));   // a host's error word ("RELOAD") is no link
+            (list || []).filter(st => st && (st.ytId || st.externalUrl || /^https?:\/\//i.test(st.url || ''))).forEach((st, i) => results.push(Object.assign(toAddonStream(st, p, ctx), { order, i, pref: prefIndex(p.id), provider: p.id })));   // a host's error word ("RELOAD") is no link
             log(`  ${p.id}: ${(list || []).length} streams in ${Date.now() - started} ms`);
         })
         .catch(err => log(`  ${p.id}: error ${err.message}`)));
@@ -374,7 +392,7 @@ async function lookup(type, id) {
     if (hadRuns.length) waits.push(Promise.all(hadRuns).then(() => new Promise(r => setTimeout(r, KNOWN_GRACE_MS)))) ;
     // new title: answer after SOFT_MS as soon as there is at least one German stream (late sites still fill the cache)
     else if (SOFT_MS > 0) waits.push(new Promise(r => {
-        const tick = () => { if (results.some(x => x.rank === 0)) r(); else if (finished < runs.length) setTimeout(tick, 500); };
+        const tick = () => { if (results.some(x => x.rank === 0 && !x.external)) r(); else if (finished < runs.length) setTimeout(tick, 500); };
         setTimeout(tick, SOFT_MS);
     }));
     await Promise.race(waits);
@@ -398,7 +416,7 @@ async function lookup(type, id) {
 }
 
 // provider order in the list (within each language group): dedicated streaming sites first, loose matchers last
-const PREFERRED = (process.env.PROVIDER_ORDER || 'serienstream,aniworld,huhuto,moflix,filmpalast,megakino,kinoking,hdfilme,filmo,kellerkino,flixitv,filmfrei24,mediathek,ard,arte,youtube,dmax,tele5,tlc,southpark,netzkino,plutotv')
+const PREFERRED = (process.env.PROVIDER_ORDER || 'serienstream,aniworld,huhuto,moflix,filmpalast,megakino,kinoking,hdfilme,filmo,kellerkino,flixitv,filmfrei24,mediathek,ard,arte,youtube,stobrowser,dmax,tele5,tlc,southpark,netzkino,plutotv')
     .split(',').map(x => x.trim());
 const prefIndex = id => { const i = PREFERRED.indexOf(id); return i < 0 ? PREFERRED.length : i; };
 const DEMOTE = new RegExp(process.env.DEMOTE_HOSTS || 'supervideo|dropload|dr0pstream|moflix-stream\\.click', 'i');
@@ -409,6 +427,7 @@ const MAX_PER_HOST = Number(process.env.MAX_PER_HOST) || 2;        // streams ke
 // the real video address behind a stream (pass-through links carry it inside), without the changing ?token part
 function videoKey(st) {
     if (st.ytId) return 'youtube/' + st.ytId;
+    if (st.externalUrl) return 'external/' + st.externalUrl;
     const job = passthrough.jobOf(st.url);
     const u = (job && job.u) || st.url || '';
     try { const x = new URL(u); return x.host + x.pathname; } catch (e) { return u.split('?')[0]; }
@@ -416,7 +435,10 @@ function videoKey(st) {
 const sortStreams = list => {
     const sorted = list.slice().sort((a, b) => demoted(a) - demoted(b) || a.rank - b.rank || (b.q || 0) - (a.q || 0) || a.pref - b.pref || a.order - b.order || a.i - b.i);
     const seen = new Set(), perHost = new Map(), out = [];
+    // the browser hand-off (SerienStream) only when nothing plays in Nuvio itself
+    const playableHere = list.some(x => x.rank === 0 && !x.external);
     for (const x of sorted) {
+        if (x.external && playableHere) continue;
         if (GERMAN_ONLY && (x.rank === 2 || (x.rank === 1 && !KEEP_GERMAN_SUBS))) continue;   // German audio only
         const vk = videoKey(x.stream);
         if (vk && seen.has(vk)) continue;                           // same upload already listed via another site
@@ -477,7 +499,7 @@ function verifyLater(key, entry, streams) {
     setTimeout(async () => {
         const results = await Promise.all(streams.slice(0, VERIFY_MAX).map(async st => {
             await verifySlot();
-            try { return st.ytId ? true : /^OK/.test(await playCheck(st)); } catch (e) { return false; } finally { verifyDone(); }
+            try { return st.ytId || st.externalUrl ? true : /^OK/.test(await playCheck(st)); } catch (e) { return false; } finally { verifyDone(); }
         }));
         verifyStats.checked += results.length;
         const dead = new Set(streams.slice(0, VERIFY_MAX).filter((st, i) => !results[i]));
@@ -630,7 +652,7 @@ async function runAudit(audit) {
 function addonManifest() {
     return {
         id: 'community.german-providers.addon',
-        version: '1.9.1',
+        version: '1.12.0',
         name: 'German Providers',
         description: `Deutsche Quellen (s.to, AniWorld, ARD, Arte, FilmPalast …) als Addon. Plugins v${pluginVersion} von InvalidPandaa/nuvio-german-providers (GPL-3.0).`,
         logo: publicBase ? `${publicBase}/logo.png` : 'https://flagcdn.com/w160/de.png',
@@ -666,7 +688,7 @@ const server = http.createServer(async (req, res) => {
         if (!providers.length) problems.push('no providers loaded');
         if (process.env.WARP !== '0' && warpDownSince && Date.now() - warpDownSince > 30 * 60000) problems.push('WARP down for over 30 minutes');
         const paused = providers.filter(p => p.pausedUntil > Date.now()).map(p => p.id);
-        return send(res, problems.length ? 503 : 200, { ok: !problems.length, problems, warp: net.warpOn(), addon: `${req.headers['x-forwarded-proto'] || 'http'}://${req.headers.host}/manifest.json`, plugins: pluginVersion, providers: providers.map(p => p.id), paused, tmdbKey: !!TMDB_API_KEY, tmdbKeyStatus: keyStatus, linkChecks: verifyStats, downHosts: net.status().down });
+        return send(res, problems.length ? 503 : 200, { ok: !problems.length, problems, warp: net.warpOn(), addon: `${req.headers['x-forwarded-proto'] || 'http'}://${req.headers.host}/manifest.json`, plugins: pluginVersion, providers: providers.map(p => p.id), paused, tmdbKey: !!TMDB_API_KEY, tmdbKeyStatus: keyStatus, linkChecks: verifyStats, serienstreamLogin: require('./sto-session.js').status().loggedIn, downHosts: net.status().down });
     }
     if (url === '/logo.png') {
         try {
@@ -691,6 +713,47 @@ const server = http.createServer(async (req, res) => {
     }
     // look at a video host page from the server (for building/fixing readers): /debug/fetch?token=<RELAY_TOKEN>&url=...&ref=...
     // password-protected so the server can't be used as an open proxy
+    // your SerienStream login for the addon (see sto-session.js): /sto/session shows a small form
+    if (url === '/sto/session') {
+        const sto = require('./sto-session.js');
+        if (req.method !== 'POST') {
+            res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-store' });
+            return res.end(`<!doctype html><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>SerienStream login</title>
+<style>body{font:16px system-ui,sans-serif;max-width:640px;margin:32px auto;padding:0 16px;background:#14171c;color:#e8e8e8}input,textarea,button{width:100%;box-sizing:border-box;margin:6px 0 14px;padding:10px;border-radius:6px;border:1px solid #444;background:#1f242c;color:#fff;font:inherit}button{background:#2d6cdf;border:0;cursor:pointer}small{color:#aaa}</style>
+<h2>SerienStream login for the addon</h2><p>Status: <b>${sto.status().loggedIn ? 'logged in (' + sto.status().source + ')' : 'not set'}</b></p>
+<form method="post"><label>Admin password</label><input name="token" type="password" autocomplete="off" required>
+<label>Your serienstream.to cookie</label><textarea name="cookie" rows="6" required placeholder="name=value; name2=value2; ..."></textarea>
+<small>Only sent to your own server. The addon sends it to serienstream.to only, never to anyone else.</small><button>Save and test</button></form>`);
+        }
+        let body = '';
+        for await (const c of req) { body += c; if (body.length > 20000) break; }
+        const q = new URLSearchParams(body);
+        if (!adminOk(q)) return send(res, 403, { error: 'wrong admin password' });
+        const enc = await sto.set(q.get('cookie') || '');
+        // live test with a known episode: logged in? does a German hoster button lead straight to the hoster?
+        const test = { loggedIn: false, hosterLink: null };
+        try {
+            const ep = 'https://serienstream.to/serie/merlin-die-neuen-abenteuer/staffel-1/episode-3';
+            const html = await (await net.smartFetch(ep, { headers: { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36' } })).text();
+            test.loggedIn = !/href="\/login"/.test(html);
+            test.gate = (html.match(/data-redirect-gate-tier="([^"]*)"/) || [])[1] || 'none';
+            const play = (html.match(/data-play-url="([^"]+)"[^>]*data-language-id="1"|data-language-id="1"[^>]*data-play-url="([^"]+)"/) || []).slice(1).find(Boolean);
+            if (play) {
+                const r = await net.smartFetch('https://serienstream.to' + play.replace(/&amp;/g, '&'), { headers: { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36', Referer: ep } });
+                const host = new URL(r.url || 'https://serienstream.to').hostname;
+                test.hosterLink = /serienstream|s\.to$/.test(host) ? null : host;
+            }
+        } catch (e) { test.error = e.message; }
+        for (const k of [...cache.keys()]) if (k.startsWith('series:')) cache.delete(k);
+        const ok = test.loggedIn && test.hosterLink;
+        res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-store' });
+        return res.end(`<!doctype html><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>SerienStream login</title>
+<style>body{font:16px system-ui,sans-serif;max-width:720px;margin:32px auto;padding:0 16px;background:#14171c;color:#e8e8e8}textarea{width:100%;box-sizing:border-box;background:#1f242c;color:#fff;border:1px solid #444;border-radius:6px;padding:10px;font:13px monospace}</style>
+<h2>${ok ? '✅ SerienStream works with your login' : '❌ Not working yet'}</h2>
+<p>Logged in: <b>${test.loggedIn ? 'yes' : 'no'}</b> · Check required: <b>${test.gate || '?'}</b> · German hoster link: <b>${test.hosterLink || 'none'}</b>${test.error ? ' · Error: ' + test.error : ''}</p>
+${ok && enc ? `<p><b>Keep it after updates:</b> on GitHub choose <i>Add file → Create new file</i>, name it <code>sto-session.enc</code>, paste everything below and commit. It is encrypted so that only your Oracle server can read it.</p><textarea rows="6" readonly onclick="this.select()">${enc}</textarea>` : ''}
+${ok && !enc ? '<p>Saved until the next server update (this machine could not create an encrypted copy).</p>' : ''}`);
+    }
     if (url === '/debug/fetch') {
         const q = new URL(req.url, 'http://x').searchParams;
         if (!adminOk(q)) return send(res, 403, { error: 'wrong token' });
@@ -845,6 +908,7 @@ const server = http.createServer(async (req, res) => {
 });
 
 if (require.main === module) {
+    require('./sto-session.js').load().then(() => log(`SerienStream login: ${JSON.stringify(require('./sto-session.js').status().source)}`)).catch(() => {});
     loadFrom(BUNDLED_DIR);
     if (!TMDB_API_KEY) {
         log('WARNING: TMDB_API_KEY is not set' + (RELAY_TOKEN ? `, asking ${KEY_SOURCE} for it` : ', every lookup will return nothing'));

@@ -141,6 +141,30 @@ async function smartFetch(input, opts = {}) {
         return out;
     }
     const started = Date.now();
+    // your own SerienStream login (sto-session.js): sent only to s.to, like your browser would. Redirects are followed
+    // by hand so the login never travels on to a video hoster.
+    let sto = null;
+    try { sto = require('./sto-session.js'); } catch (e) {}
+    const stoCookie = sto && sto.forHost(host);
+    if (stoCookie) {
+        const hh = plainHeaders(opts.headers);
+        const ck = Object.keys(hh).find(k => k.toLowerCase() === 'cookie');
+        hh[ck || 'Cookie'] = ck && hh[ck] ? `${hh[ck]}; ${stoCookie}` : stoCookie;
+        const t = Date.now();
+        const r = await nativeFetch(url, Object.assign({}, opts, { headers: hh, redirect: 'manual', signal: opts.signal || AbortSignal.timeout(timeoutFor(url)) }));
+        try { sto.update(typeof r.headers.getSetCookie === 'function' ? r.headers.getSetCookie() : [r.headers.get('set-cookie')].filter(Boolean)); } catch (e) {}
+        const loc = r.status >= 300 && r.status < 400 && r.headers.get('location');
+        trace({ url, route: 'node+login', status: r.status, ms: Date.now() - t, snippet: loc ? `-> ${loc}`.slice(0, 200) : undefined });
+        if (!loc) return r;
+        const next = new URL(loc, url).href;
+        const nh = plainHeaders(opts.headers);
+        for (const k of Object.keys(nh)) if (k.toLowerCase() === 'cookie') delete nh[k];
+        const toGet = r.status === 303 || ((r.status === 301 || r.status === 302) && String(opts.method || 'GET').toUpperCase() === 'POST');
+        const hop = Object.assign({}, opts, { headers: nh, _hops: (opts._hops || 0) + 1 });
+        if (toGet) { hop.method = 'GET'; delete hop.body; }
+        if (hop._hops > 8) throw new Error('too many redirects');
+        return smartFetch(next, hop);
+    }
     const h = plainHeaders(opts.headers);
     const uaKey = Object.keys(h).find(k => k.toLowerCase() === 'user-agent');
     const browserLike = !uaKey || /Mozilla/i.test(h[uaKey]);
