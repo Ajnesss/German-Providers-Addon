@@ -72,4 +72,4 @@ function update(setCookieLines) {
 
 const forHost = host => (cookie && (HOSTS.test(String(host || '').replace(/^www\./, '')) || (process.env.STO_TEST_HOST && host === process.env.STO_TEST_HOST))) ? cookie : '';
 
-module.exports = { load, set, update, forHost, status: () => ({ loggedIn: !!cookie, source, names: cookie ? cookie.split('; ').map(x => x.split('=')[0]) : [] }), HOSTS, _clean: clean };
+module.exports = { keyOfMachine, load, set, update, forHost, status: () => ({ loggedIn: !!cookie, source, names: cookie ? cookie.split('; ').map(x => x.split('=')[0]) : [] }), HOSTS, _clean: clean };

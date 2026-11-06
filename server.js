@@ -657,7 +657,7 @@ async function runAudit(audit) {
 function addonManifest() {
     return {
         id: 'community.german-providers.addon',
-        version: '1.13.0',
+        version: '1.14.0',
         name: 'German Providers',
         description: `Deutsche Quellen (s.to, AniWorld, ARD, Arte, FilmPalast …) als Addon. Plugins v${pluginVersion} von InvalidPandaa/nuvio-german-providers (GPL-3.0).`,
         logo: publicBase ? `${publicBase}/logo.png` : 'https://flagcdn.com/w160/de.png',
@@ -679,6 +679,55 @@ function send(res, code, body, maxAge) {
     res.end(JSON.stringify(body).replace(/(api_key=)[^&"\s]+/g, '$1***'));
 }
 
+// SerienStream login test with a known episode: does a German hoster button lead straight to the hoster?
+async function stoTest() {
+    const test = { loggedIn: false, hosterLink: null };
+    try {
+        const UAx = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36';
+        const ep = 'https://serienstream.to/serie/merlin-die-neuen-abenteuer/staffel-1/episode-3';
+        const html = await (await net.smartFetch(ep, { headers: { 'User-Agent': UAx } })).text();
+        test.loggedIn = /logout|abmelden/i.test(html) || !/href="\/login"/.test(html);
+        test.gate = (html.match(/data-redirect-gate-tier="([^"]*)"/) || [])[1] || 'none';
+        const play = (html.match(/data-play-url="([^"]+)"[^>]*data-language-id="1"|data-language-id="1"[^>]*data-play-url="([^"]+)"/) || []).slice(1).find(Boolean);
+        if (play) {
+            const r = await net.smartFetch('https://serienstream.to' + play.replace(/&amp;/g, '&'), { headers: { 'User-Agent': UAx, Referer: ep } });
+            const host = new URL(r.url || 'https://serienstream.to').hostname;
+            test.hosterLink = /serienstream|s\.to$/.test(host) ? null : host;
+        }
+    } catch (e) { test.error = e.message; }
+    return test;
+}
+
+// ---------- daily phone notification (notify.js) ----------
+const NOTIFY_TITLES = [['movie', 'tt0133093'], ['series', 'tt1199099:1:1'], ['series', 'tt1695360:1:1'], ['series', 'tt0388629:1:1']];
+async function notifyRun() {
+    const notify = require('./notify.js');
+    const st = await notify.run({
+        stoCheck: async () => require('./sto-session.js').status().loggedIn ? !!(await stoTest()).hosterLink : null,
+        providerCounts: async () => {
+            const counts = {};
+            for (const [type, id] of NOTIFY_TITLES) {
+                const [ref, se, ep] = id.split(':');
+                const pType = type === 'movie' ? 'movie' : 'tv';
+                const tmdbId = await toTmdb(ref, pType).catch(() => null);
+                if (!tmdbId) continue;
+                await Promise.all(providers.filter(p => p.types.includes(pType)).map(async p => {
+                    const n = await runProvider(p, tmdbId, pType, se ? Number(se) : null, ep ? Number(ep) : null).then(l => (l || []).length, () => 0);
+                    counts[p.name || p.id] = (counts[p.name || p.id] || 0) + n;
+                }));
+            }
+            return counts;
+        },
+    }, log);
+    // a failed SerienStream check is repeated an hour later before you are told
+    if (st.stoFails === 1) setTimeout(() => notifyRun().catch(() => {}), 60 * 60000).unref();
+    log(`notify check: SerienStream ${st.sto}, providers ${JSON.stringify(Object.fromEntries(Object.entries(st.providers).map(([k, v]) => [k, v.n])))}`);
+}
+if (process.env.NOTIFY !== '0' && require.main === module) {
+    setTimeout(() => notifyRun().catch(e => log(`notify: ${e.message}`)), 15 * 60000).unref();
+    setInterval(() => notifyRun().catch(e => log(`notify: ${e.message}`)), 24 * 3600 * 1000).unref();
+}
+
 const server = http.createServer(async (req, res) => {
     if (!process.env.PUBLIC_URL && req.headers.host && !/^(localhost|127\.|10\.|192\.168\.)/.test(req.headers.host)) {
         publicBase = `${req.headers['x-forwarded-proto'] || 'http'}://${req.headers.host}`;
@@ -693,7 +742,7 @@ const server = http.createServer(async (req, res) => {
         if (!providers.length) problems.push('no providers loaded');
         if (process.env.WARP !== '0' && warpDownSince && Date.now() - warpDownSince > 30 * 60000) problems.push('WARP down for over 30 minutes');
         const paused = providers.filter(p => p.pausedUntil > Date.now()).map(p => p.id);
-        return send(res, problems.length ? 503 : 200, { ok: !problems.length, problems, warp: net.warpOn(), addon: `${req.headers['x-forwarded-proto'] || 'http'}://${req.headers.host}/manifest.json`, plugins: pluginVersion, providers: providers.map(p => p.id), paused, tmdbKey: !!TMDB_API_KEY, tmdbKeyStatus: keyStatus, linkChecks: verifyStats, serienstreamLogin: require('./sto-session.js').status().loggedIn, downHosts: net.status().down });
+        return send(res, problems.length ? 503 : 200, { ok: !problems.length, problems, warp: net.warpOn(), addon: `${req.headers['x-forwarded-proto'] || 'http'}://${req.headers.host}/manifest.json`, plugins: pluginVersion, providers: providers.map(p => p.id), paused, tmdbKey: !!TMDB_API_KEY, tmdbKeyStatus: keyStatus, linkChecks: verifyStats, serienstreamLogin: require('./sto-session.js').status().loggedIn, notify: (() => { const n = require('./notify.js').state; return { lastRun: n.lastRun, serienstream: n.sto, sent: n.sent.slice(0, 3) }; })(), downHosts: net.status().down });
     }
     if (url === '/logo.png') {
         try {
@@ -718,6 +767,18 @@ const server = http.createServer(async (req, res) => {
     }
     // look at a video host page from the server (for building/fixing readers): /debug/fetch?token=<RELAY_TOKEN>&url=...&ref=...
     // password-protected so the server can't be used as an open proxy
+    // phone notifications: /notify/test?token=<admin> sends a test message and shows the channel to subscribe to
+    if (url === '/notify/test' || url === '/notify/run') {
+        const q = new URL(req.url, 'http://x').searchParams;
+        if (!adminOk(q)) return send(res, 403, { error: 'wrong token' });
+        const notify = require('./notify.js');
+        try {
+            if (url === '/notify/run') { await notifyRun(); return send(res, 200, notify.state); }
+            const topic = await notify.getTopic();
+            const ok = await notify.send('German addon: test', 'Notifications work. You will only hear from the addon again when something breaks.', 'tada');
+            return send(res, 200, { sent: ok, channel: topic, subscribe: `https://ntfy.sh/${topic}` });
+        } catch (e) { return send(res, 200, { error: e.message }); }
+    }
     // your SerienStream login for the addon (see sto-session.js): /sto/session shows a small form
     if (url === '/sto/session') {
         const sto = require('./sto-session.js');
@@ -735,20 +796,7 @@ const server = http.createServer(async (req, res) => {
         const q = new URLSearchParams(body);
         if (!adminOk(q)) return send(res, 403, { error: 'wrong admin password' });
         const enc = await sto.set(q.get('cookie') || '');
-        // live test with a known episode: logged in? does a German hoster button lead straight to the hoster?
-        const test = { loggedIn: false, hosterLink: null };
-        try {
-            const ep = 'https://serienstream.to/serie/merlin-die-neuen-abenteuer/staffel-1/episode-3';
-            const html = await (await net.smartFetch(ep, { headers: { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36' } })).text();
-            test.loggedIn = /logout|abmelden/i.test(html) || !/href="\/login"/.test(html);
-            test.gate = (html.match(/data-redirect-gate-tier="([^"]*)"/) || [])[1] || 'none';
-            const play = (html.match(/data-play-url="([^"]+)"[^>]*data-language-id="1"|data-language-id="1"[^>]*data-play-url="([^"]+)"/) || []).slice(1).find(Boolean);
-            if (play) {
-                const r = await net.smartFetch('https://serienstream.to' + play.replace(/&amp;/g, '&'), { headers: { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36', Referer: ep } });
-                const host = new URL(r.url || 'https://serienstream.to').hostname;
-                test.hosterLink = /serienstream|s\.to$/.test(host) ? null : host;
-            }
-        } catch (e) { test.error = e.message; }
+        const test = await stoTest();
         for (const k of [...cache.keys()]) if (k.startsWith('series:')) cache.delete(k);
         const ok = !!test.hosterLink;   // the real proof: a German hoster button leads straight to the hoster
         if (ok) test.loggedIn = true;
