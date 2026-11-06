@@ -1,6 +1,6 @@
 // Phone notifications through ntfy (ntfy.sh, free, no account): once a day the server checks
 //   - that your SerienStream login still leads to German hoster links, and
-//   - that each provider still finds something for a few well-known titles,
+//   - that each provider still gives streams that actually start playing, for a few well-known titles,
 // and sends a message only when something breaks (and again when it works again).
 // The channel name is derived from this Oracle machine's private id, so it is not in the public repository;
 // /notify/test?token=<admin password> shows it and sends a test message.
@@ -55,8 +55,8 @@ async function run(checks, log = () => {}) {
             if (prev && prev.n === 0 && prev.alerted && n > 0) back.push(id);
             state.providers[id] = { n, alerted: n === 0 && (prev && (prev.alerted || prev.n > 0)) };
         }
-        if (down.length) await send(`Provider stopped finding streams: ${down.join(', ')}`, `${down.join(', ')} found nothing for the test titles today (they did before). Ask Claude to look at it.`);
-        if (back.length) await send(`Provider working again: ${back.join(', ')}`, `${back.join(', ')} finds streams again.`, 'white_check_mark');
+        if (down.length) await send(`Provider stopped working: ${down.join(', ')}`, `${down.join(', ')} gave no working stream for the test titles today (they did before): nothing found, or nothing that plays. Ask Claude to look at it.`);
+        if (back.length) await send(`Provider working again: ${back.join(', ')}`, `${back.join(', ')} gives working streams again.`, 'white_check_mark');
     } catch (e) { log(`notify: provider check failed: ${e.message}`); }
     return state;
 }

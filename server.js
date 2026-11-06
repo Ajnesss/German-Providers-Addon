@@ -704,7 +704,7 @@ async function runAudit(audit) {
 function addonManifest() {
     return {
         id: 'community.german-providers.addon',
-        version: '1.15.1',
+        version: '1.16.0',
         name: 'German Providers',
         description: `Deutsche Quellen (s.to, AniWorld, ARD, Arte, FilmPalast …) als Addon. Plugins v${pluginVersion} von InvalidPandaa/nuvio-german-providers (GPL-3.0).`,
         logo: publicBase ? `${publicBase}/logo.png` : 'https://flagcdn.com/w160/de.png',
@@ -759,7 +759,13 @@ async function notifyRun() {
                 const tmdbId = await toTmdb(ref, pType).catch(() => null);
                 if (!tmdbId) continue;
                 await Promise.all(providers.filter(p => p.types.includes(pType)).map(async p => {
-                    const n = await runProvider(p, tmdbId, pType, se ? Number(se) : null, ep ? Number(ep) : null).then(l => (l || []).length, () => 0);
+                    const list = await runProvider(p, tmdbId, pType, se ? Number(se) : null, ep ? Number(ep) : null).catch(() => []) || [];
+                    // count only streams that really start (up to 2 tried per title), so a site whose links all fail is noticed too
+                    let n = 0;
+                    for (const raw of list.filter(x => x && x.url).slice(0, 2)) {
+                        const st = toAddonStream(raw, p, { type, id }).stream;
+                        if (/^OK/.test(await playCheck(st).catch(() => 'FAIL'))) { n++; break; }
+                    }
                     counts[p.name || p.id] = (counts[p.name || p.id] || 0) + n;
                 }));
             }
