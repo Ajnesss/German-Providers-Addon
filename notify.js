@@ -33,13 +33,20 @@ async function run(checks, log = () => {}) {
     try {
         const ok = await checks.stoCheck();
         if (ok === null) state.sto = 'no login';
-        else if (ok) {
-            if (state.sto === 'broken') await send('SerienStream works again', 'Your SerienStream login is working again.', 'white_check_mark');
+        else if (ok === true) {
+            if (state.sto === 'broken' || state.sto === 'check') await send('SerienStream works again', 'SerienStream gives the addon hoster links again.', 'white_check_mark');
             state.sto = 'ok'; state.stoFails = 0;
         } else {
             state.stoFails++;
             // twice in a row (one check now, one an hour later), so a single hiccup doesn't wake you
-            if (state.stoFails >= 2 && state.sto !== 'broken') {
+            if (ok === 'check') {
+                // logged in fine, but s.to shows its human check to the server: nothing to do on your side
+                if (state.stoFails >= 2 && state.sto !== 'check') {
+                    state.sto = 'check';
+                    await send('SerienStream paused',
+                        "s.to is showing its human check to the server right now (your login is fine). SerienStream links are missing until s.to stops; you'll get a message when it works again.");
+                }
+            } else if (state.stoFails >= 2 && state.sto !== 'broken') {
                 state.sto = 'broken';
                 await send('SerienStream login stopped working',
                     'SerienStream no longer accepts the saved login. Copy a fresh cookie into https://fortune-addon.duckdns.org/sto/session and upload the new sto-session.enc to GitHub.');

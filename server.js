@@ -377,8 +377,15 @@ async function lookup(type, id) {
     const active = providers.filter(p => p.types.includes(pType));
     const results = [];
     const started = Date.now();
+    const stoAccess = require('./sto-access.js');
+    const goodKey = `${pType}:${tmdbId}:${season}:${episode}`;
     const runs = active.map((p, order) => runProvider(p, tmdbId, pType, season, episode)
         .then(list => {
+            // SerienStream: keep its last working answer; while s.to can't be asked, that answer stands in
+            if (p.id === 'serienstream' && pType === 'tv') {
+                if (list && list.length) stoAccess.rememberGood(goodKey, list);
+                else if (net.stoGated()) { const prev = stoAccess.standIn(goodKey); if (prev) { list = prev; log(`  serienstream: s.to paused, using its last working answer for this episode`); } stoMissed.add(`${type}:${id}`); }
+            }
             (list || []).filter(st => st && (st.ytId || st.externalUrl || /^https?:\/\//i.test(st.url || ''))).forEach((st, i) => results.push(Object.assign(toAddonStream(st, p, ctx), { order, i, pref: prefIndex(p.id), provider: p.id })));   // a host's error word ("RELOAD") is no link
             log(`  ${p.id}: ${(list || []).length} streams in ${Date.now() - started} ms`);
         })
@@ -563,6 +570,21 @@ function verifyLater(key, entry, streams) {
     }, 3000).unref();
 }
 
+// episodes looked up while s.to showed its check: when it works again, they are looked up afresh (quietly, in the
+// background, one after another), so SerienStream's links are back before anyone asks
+const stoMissed = new Set();
+function onStoRecovered() {
+    const keys = [...stoMissed].slice(-10);
+    stoMissed.clear();
+    log(`s.to answers normally again: refreshing ${keys.length} episode(s) looked up meanwhile`);
+    const stoAccess = require('./sto-access.js');
+    keys.reduce((chain, key) => chain.then(() => {
+        cache.delete(key);
+        const [type, ...rest] = key.split(':');
+        return stoAccess.priority.run('low', () => getStreams(type, rest.join(':'), true)).catch(() => {});
+    }), Promise.resolve());
+}
+require('./sto-access.js').onRecover(() => onStoRecovered());
 function getStreams(type, id, prefetched) {
     const key = `${type}:${id}`;
     const hit = cache.get(key);
@@ -570,6 +592,8 @@ function getStreams(type, id, prefetched) {
     const promise = lookup(type, id).then(streams => {
         // nothing found: only remember that briefly
         entry.ttl = (streams.length ? (prefetched ? PREFETCH_MIN : CACHE_MIN) : 2) * 60000;
+        // s.to showed its check during this lookup: SerienStream's links are missing, so look again in 30 minutes
+        if (type === 'series' && net.stoGated()) entry.ttl = Math.min(entry.ttl, 30 * 60000);
         verifyLater(key, entry, streams);
         return streams;
     }, err => { cache.delete(key); throw err; });
@@ -704,7 +728,7 @@ async function runAudit(audit) {
 function addonManifest() {
     return {
         id: 'community.german-providers.addon',
-        version: '1.16.1',
+        version: '1.17.0',
         name: 'German Providers',
         description: `Deutsche Quellen (s.to, AniWorld, ARD, Arte, FilmPalast …) als Addon. Plugins v${pluginVersion} von InvalidPandaa/nuvio-german-providers (GPL-3.0).`,
         logo: publicBase ? `${publicBase}/logo.png` : 'https://flagcdn.com/w160/de.png',
@@ -733,13 +757,14 @@ async function stoTest() {
         const UAx = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36';
         const ep = 'https://serienstream.to/serie/merlin-die-neuen-abenteuer/staffel-1/episode-3';
         const html = await (await net.smartFetch(ep, { headers: { 'User-Agent': UAx } })).text();
-        test.loggedIn = /logout|abmelden/i.test(html) || !/href="\/login"/.test(html);
+        test.loggedIn = net.stoInit() ? (await require('./sto-access.js').checkLogin()) === 'ok' : /Abmelden|logout/i.test(html);
         test.gate = (html.match(/data-redirect-gate-tier="([^"]*)"/) || [])[1] || 'none';
         const play = (html.match(/data-play-url="([^"]+)"[^>]*data-language-id="1"|data-language-id="1"[^>]*data-play-url="([^"]+)"/) || []).slice(1).find(Boolean);
         if (play) {
-            const r = await net.smartFetch('https://serienstream.to' + play.replace(/&amp;/g, '&'), { headers: { 'User-Agent': UAx, Referer: ep } });
+            const r = await net.smartFetch('https://serienstream.to' + play.replace(/&amp;/g, '&'), { headers: { 'User-Agent': UAx, Referer: ep }, _stoProbe: true });
             const host = new URL(r.url || 'https://serienstream.to').hostname;
             test.hosterLink = /serienstream|s\.to$/.test(host) ? null : host;
+            if (!test.hosterLink) test.checkPage = /frameBridge/.test(await r.text().catch(() => ''));
         }
     } catch (e) { test.error = e.message; }
     return test;
@@ -750,7 +775,11 @@ const NOTIFY_TITLES = [['movie', 'tt0133093'], ['series', 'tt1199099:1:1'], ['se
 async function notifyRun() {
     const notify = require('./notify.js');
     const st = await notify.run({
-        stoCheck: async () => require('./sto-session.js').status().loggedIn ? !!(await stoTest()).hosterLink : null,
+        stoCheck: async () => {
+            if (!require('./sto-session.js').status().loggedIn) return null;
+            const t = await stoTest();
+            return t.hosterLink ? true : (t.loggedIn && t.checkPage ? 'check' : false);
+        },
         providerCounts: async () => {
             const counts = {};
             for (const [type, id] of NOTIFY_TITLES) {
@@ -773,7 +802,7 @@ async function notifyRun() {
         },
     }, log);
     // a failed SerienStream check is repeated an hour later before you are told
-    if (st.stoFails === 1) setTimeout(() => notifyRun().catch(() => {}), 60 * 60000).unref();
+    if (st.stoFails >= 1 && st.stoFails <= 24) setTimeout(() => notifyRun().catch(() => {}), 60 * 60000).unref();
     log(`notify check: SerienStream ${st.sto}, providers ${JSON.stringify(Object.fromEntries(Object.entries(st.providers).map(([k, v]) => [k, v.n])))}`);
 }
 if (process.env.NOTIFY !== '0' && require.main === module) {
@@ -788,6 +817,7 @@ const server = http.createServer(async (req, res) => {
     if ((req.url || '').startsWith('/p/')) return passthrough.handle(req, res, publicBase || `http://${req.headers.host}`);
     const url = decodeURIComponent((req.url || '/').split('?')[0]);
     if (req.method === 'OPTIONS') return send(res, 204, {});
+    if (url === '/sto/status') { net.stoInit(); return send(res, 200, net.stoStatus()); }
     if (url === '/' || url === '/health') {
         // a real check: cron-job.org's "notify on failure" emails when this is not 200
         const problems = [];
@@ -795,7 +825,7 @@ const server = http.createServer(async (req, res) => {
         if (!providers.length) problems.push('no providers loaded');
         if (process.env.WARP !== '0' && warpDownSince && Date.now() - warpDownSince > 30 * 60000) problems.push('WARP down for over 30 minutes');
         const paused = providers.filter(p => p.pausedUntil > Date.now()).map(p => p.id);
-        return send(res, problems.length ? 503 : 200, { ok: !problems.length, problems, warp: net.warpOn(), addon: `${req.headers['x-forwarded-proto'] || 'http'}://${req.headers.host}/manifest.json`, plugins: pluginVersion, providers: providers.map(p => p.id), paused, tmdbKey: !!TMDB_API_KEY, tmdbKeyStatus: keyStatus, linkChecks: verifyStats, serienstreamLogin: require('./sto-session.js').status().loggedIn, notify: (() => { const n = require('./notify.js').state; return { lastRun: n.lastRun, serienstream: n.sto, sent: n.sent.slice(0, 3) }; })(), downHosts: net.status().down });
+        return send(res, problems.length ? 503 : 200, { ok: !problems.length, problems, warp: net.warpOn(), addon: `${req.headers['x-forwarded-proto'] || 'http'}://${req.headers.host}/manifest.json`, plugins: pluginVersion, providers: providers.map(p => p.id), paused, tmdbKey: !!TMDB_API_KEY, tmdbKeyStatus: keyStatus, linkChecks: verifyStats, serienstreamLogin: require('./sto-session.js').status().loggedIn, serienstreamCheck: (() => { if (!net.stoInit()) return null; const x = net.stoStatus(); return { links: x.links, meaning: x.meaning, since: x.since, login: x.login, availabilityPercent: x.availabilityPercent, details: '/sto/status' }; })(), notify: (() => { const n = require('./notify.js').state; return { lastRun: n.lastRun, serienstream: n.sto, sent: n.sent.slice(0, 3) }; })(), downHosts: net.status().down });
     }
     if (url === '/logo.png') {
         try {
@@ -926,7 +956,7 @@ ${ok && !enc ? '<p>Saved until the next server update (this machine could not cr
             const inline = [...html.matchAll(/<script(?![^>]*src=)[^>]*>([\s\S]*?)<\/script>/g)].map(m => m[1].trim()).filter(Boolean);
             let r = null;
             if (play) {
-                const rr = await net.smartFetch(base + play.replace(/&amp;/g, '&'), { headers: { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36', Referer: epUrl } });
+                const rr = await net.smartFetch(base + play.replace(/&amp;/g, '&'), { headers: { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36', Referer: epUrl }, _stoProbe: true });
                 r = { status: rr.status, finalUrl: rr.url, setCookie: rr.headers.get('set-cookie'), body: await rr.text() };
             }
             const report = {
@@ -997,12 +1027,12 @@ ${ok && !enc ? '<p>Saved until the next server update (this machine could not cr
         const ep = m[1] !== 'movie' && m[2].match(/^(.*):(\d+):(\d+)$/);
         if (PREFETCH && ep && streams.length) {
             const next = `${ep[1]}:${ep[2]}:${Number(ep[3]) + 1}`;
-            setTimeout(() => getStreams(m[1], next, true).then(l => {
+            setTimeout(() => require('./sto-access.js').priority.run('low', () => getStreams(m[1], next, true)).then(l => {
                 log(`prefetched ${next}: ${l.length} streams`);
                 // nothing there: probably the season's last episode, so get the next season's first one ready
                 if (!l.length) {
                     const first = `${ep[1]}:${Number(ep[2]) + 1}:1`;
-                    return getStreams(m[1], first, true).then(f => log(`prefetched ${first}: ${f.length} streams`));
+                    return require('./sto-access.js').priority.run('low', () => getStreams(m[1], first, true)).then(f => log(`prefetched ${first}: ${f.length} streams`));
                 }
             }).catch(() => {}), 5000);
         }
@@ -1015,7 +1045,7 @@ ${ok && !enc ? '<p>Saved until the next server update (this machine could not cr
 });
 
 if (require.main === module) {
-    require('./sto-session.js').load().then(() => log(`SerienStream login: ${JSON.stringify(require('./sto-session.js').status().source)}`)).catch(() => {});
+    require('./sto-session.js').load().then(() => { log(`SerienStream login: ${JSON.stringify(require('./sto-session.js').status().source)}`); net.stoInit(); }).catch(() => {});
     loadFrom(BUNDLED_DIR);
     if (!TMDB_API_KEY) {
         log('WARNING: TMDB_API_KEY is not set' + (RELAY_TOKEN ? `, asking ${KEY_SOURCE} for it` : ', every lookup will return nothing'));
