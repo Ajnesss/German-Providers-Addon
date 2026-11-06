@@ -494,22 +494,43 @@ passthrough.setRefresher(async ([type, id, prov, host], failedUrl) => {
 // answer is never held up; whatever isn't known in time keeps its label.
 const LABEL_MS = Number(process.env.LABEL_MS) || 1500;
 const UNSURE = new Set(['𝗔𝘂𝘁𝗼', '𝗦𝘁𝗿𝗲𝗮𝗺']);
+// MP4 files: the video track's size sits in its "tkhd" box near the start of the file (when the file is web-optimised)
+function mp4Height(buf) {
+    let best = 0;
+    for (let i = buf.indexOf('tkhd'); i >= 4 && i < buf.length - 90; i = buf.indexOf('tkhd', i + 4)) {
+        const v = buf[i + 4];
+        const off = i + 4 + 4 + (v === 1 ? 32 : 20) + 8 + 8 + 36;   // version/flags, times+id+duration, reserved, layer..volume, matrix
+        if (off + 8 > buf.length) continue;
+        const w = buf.readUInt32BE(off) / 65536, h = buf.readUInt32BE(off + 4) / 65536;
+        if (w > 0 && h > 0 && h < 5000) best = Math.max(best, Math.round(h));
+    }
+    return best;
+}
 async function probeHeight(stream) {
     const port = (server.address() || {}).port || PORT;
     const url = publicBase && stream.url.startsWith(publicBase) ? stream.url.replace(publicBase, `http://127.0.0.1:${port}`) : stream.url;
-    const headers = Object.assign({ 'User-Agent': 'ExoPlayer', 'X-Gpa-Check': '1' }, ((stream.behaviorHints || {}).proxyHeaders || {}).request);
+    const headers = Object.assign({ 'User-Agent': 'ExoPlayer', 'X-Gpa-Check': '1', Range: 'bytes=0-262143' }, ((stream.behaviorHints || {}).proxyHeaders || {}).request);
     const r = await fetch(url, { headers, signal: AbortSignal.timeout(6000) });
-    const text = (await r.text()).slice(0, 200000);
-    if (!/^#EXTM3U/.test(text.trim())) return 0;
-    const hs = [...text.matchAll(/RESOLUTION=\d+x(\d+)/g)].map(m => Number(m[1]));
-    return hs.length ? Math.max(...hs) : 0;
+    const buf = Buffer.from(await r.arrayBuffer());
+    const head = buf.toString('utf8', 0, 16).trim();
+    if (head.startsWith('#EXTM3U')) {
+        const hs = [...buf.toString('utf8').matchAll(/RESOLUTION=\d+x(\d+)/g)].map(m => Number(m[1]));
+        return hs.length ? Math.max(...hs) : 0;
+    }
+    return mp4Height(buf);
 }
 async function labelStreams(list, budgetMs) {
     const todo = list.filter(st => st && st.url && !st.ytId && !st.externalUrl && UNSURE.has(st.name));
     if (!todo.length) return list;
     const work = Promise.all(todo.slice(0, 12).map(async st => {
         const h = await probeHeight(st).catch(() => 0);
-        if (h) st.name = RES_LABEL(`${h >= 2000 ? 2160 : h >= 1300 ? 1440 : h >= 1000 ? 1080 : h >= 700 ? 720 : 480}p`);
+        if (!h) return;
+        const res = `${h >= 2000 ? 2160 : h >= 1300 ? 1440 : h >= 1000 ? 1080 : h >= 700 ? 720 : 480}p`;
+        st.name = RES_LABEL(res);
+        // the release-style name too: AIOStreams and Nuvio's badges read the resolution from it
+        const bh = st.behaviorHints || {};
+        if (bh.filename && !/\.(2160|1440|1080|720|480)p\./.test(bh.filename))
+            bh.filename = bh.filename.replace(/^(.*?\.(?:S\d\dE\d\d|\d{4}))\./, `$1.${res}.`);
     }));
     await Promise.race([work, new Promise(r => setTimeout(r, budgetMs))]);
     return list;
@@ -683,7 +704,7 @@ async function runAudit(audit) {
 function addonManifest() {
     return {
         id: 'community.german-providers.addon',
-        version: '1.15.0',
+        version: '1.15.1',
         name: 'German Providers',
         description: `Deutsche Quellen (s.to, AniWorld, ARD, Arte, FilmPalast …) als Addon. Plugins v${pluginVersion} von InvalidPandaa/nuvio-german-providers (GPL-3.0).`,
         logo: publicBase ? `${publicBase}/logo.png` : 'https://flagcdn.com/w160/de.png',
