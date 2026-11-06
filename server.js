@@ -213,7 +213,7 @@ const RANK = { de: 0, 'de-sub': 1, other: 2 };
 
 // ---------- display (same style as Fortune's AIOStreams "Select" template) ----------
 const RES_LABEL = q => /2160|\b4k\b|uhd/i.test(q) ? '𝟰𝗞' : /1440/.test(q) ? '𝗤𝗛𝗗' : /1080/.test(q) ? '𝗙𝗛𝗗' : /720/.test(q) ? '𝗛𝗗'
-    : /\b(480|360|240)p?\b|\bsd\b/i.test(q) ? '𝗦𝗗' : /auto|hls|m3u8/i.test(q) ? '𝗔𝘂𝘁𝗼' : '𝗨𝗻𝗸𝗻𝗼𝘄𝗻';
+    : /\b(480|360|240)p?\b|\bsd\b/i.test(q) ? '𝗦𝗗' : /auto|hls|m3u8/i.test(q) ? '𝗔𝘂𝘁𝗼' : '𝗦𝘁𝗿𝗲𝗮𝗺';
 const LANG_EN = { Deutsch: 'German', Englisch: 'English', 'Französisch': 'French', Japanisch: 'Japanese', Spanisch: 'Spanish', Italienisch: 'Italian', 'Türkisch': 'Turkish', Russisch: 'Russian' };
 function hostLabel(text) {
     const t = String(text || '').split('\n')[0].trim();
@@ -414,10 +414,10 @@ async function lookup(type, id) {
         // late providers still finish in the background; refresh the cache with the full list for the next request
         Promise.all(runs).then(() => {
             const key = `${type}:${id}`;
-            if (results.length > snapshot.length) { const full = sortStreams(results); const e2 = { time: Date.now(), ttl: CACHE_MIN * 60000, promise: Promise.resolve(full) }; cache.set(key, e2); verifyLater(key, e2, full); }
+            if (results.length > snapshot.length) { const full = sortStreams(results); const e2 = { time: Date.now(), ttl: CACHE_MIN * 60000, promise: labelStreams(full, 8000) }; cache.set(key, e2); verifyLater(key, e2, full); }
         });
     }
-    return sortStreams(snapshot);
+    return labelStreams(sortStreams(snapshot), LABEL_MS);
 }
 
 // provider order in the list (within each language group): dedicated streaming sites first, loose matchers last
@@ -488,6 +488,32 @@ passthrough.setRefresher(async ([type, id, prov, host], failedUrl) => {
     if (!fallback) return null;
     return passthrough.jobOf(fallback.url) ? passthrough.markFresh(fallback.url) : fallback.url;
 });
+
+// Streams without a known resolution ("Auto" / no label): read the video's quality list (the HLS master playlist,
+// a few KB) and show the best resolution it offers, e.g. FHD. Done in parallel with a short time limit, so the
+// answer is never held up; whatever isn't known in time keeps its label.
+const LABEL_MS = Number(process.env.LABEL_MS) || 1500;
+const UNSURE = new Set(['𝗔𝘂𝘁𝗼', '𝗦𝘁𝗿𝗲𝗮𝗺']);
+async function probeHeight(stream) {
+    const port = (server.address() || {}).port || PORT;
+    const url = publicBase && stream.url.startsWith(publicBase) ? stream.url.replace(publicBase, `http://127.0.0.1:${port}`) : stream.url;
+    const headers = Object.assign({ 'User-Agent': 'ExoPlayer', 'X-Gpa-Check': '1' }, ((stream.behaviorHints || {}).proxyHeaders || {}).request);
+    const r = await fetch(url, { headers, signal: AbortSignal.timeout(6000) });
+    const text = (await r.text()).slice(0, 200000);
+    if (!/^#EXTM3U/.test(text.trim())) return 0;
+    const hs = [...text.matchAll(/RESOLUTION=\d+x(\d+)/g)].map(m => Number(m[1]));
+    return hs.length ? Math.max(...hs) : 0;
+}
+async function labelStreams(list, budgetMs) {
+    const todo = list.filter(st => st && st.url && !st.ytId && !st.externalUrl && UNSURE.has(st.name));
+    if (!todo.length) return list;
+    const work = Promise.all(todo.slice(0, 12).map(async st => {
+        const h = await probeHeight(st).catch(() => 0);
+        if (h) st.name = RES_LABEL(`${h >= 2000 ? 2160 : h >= 1300 ? 1440 : h >= 1000 ? 1080 : h >= 700 ? 720 : 480}p`);
+    }));
+    await Promise.race([work, new Promise(r => setTimeout(r, budgetMs))]);
+    return list;
+}
 
 // After answering, try every link like the player would (a few KB each, in the background) and move links that
 // don't start to the end of the cached list. The next request for this episode (autoplay, the prefetched next
@@ -657,7 +683,7 @@ async function runAudit(audit) {
 function addonManifest() {
     return {
         id: 'community.german-providers.addon',
-        version: '1.14.0',
+        version: '1.15.0',
         name: 'German Providers',
         description: `Deutsche Quellen (s.to, AniWorld, ARD, Arte, FilmPalast …) als Addon. Plugins v${pluginVersion} von InvalidPandaa/nuvio-german-providers (GPL-3.0).`,
         logo: publicBase ? `${publicBase}/logo.png` : 'https://flagcdn.com/w160/de.png',
