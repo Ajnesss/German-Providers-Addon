@@ -49,10 +49,10 @@ async function getStreams(tmdbId, type, season, episode) {
             const main = t => norm(String(t || '').split(/\s[-–]\s/)[0]);   // "Johnny Guitar - Gejagt, gehaßt, gefürchtet" -> "johnny guitar"
             const f = cat.western.find(x => (names.includes(norm(x.t)) || names.includes(main(x.t)) || names.map(main).includes(main(x.t))) && (!year || !x.j || Math.abs(Number(x.j) - year) <= 1)
                 && (!runtime || !x.m || Math.abs(runtime - x.m) <= Math.max(12, runtime * 0.25)));
-            if (f) return [{ name: 'dailyme · Deutsch · Western', title: `${f.t} (${f.j || ''})`, url: `https://mini-cms.daygent.de/film/play/${encodeURIComponent(f.id)}.m3u8`, quality: 'auto' }];
+            if (f) return [{ name: 'dailyme · Deutsch · dailyme', title: `${f.t} (${f.j || ''})`, url: `https://mini-cms.daygent.de/film/play/${encodeURIComponent(f.id)}.m3u8`, quality: 'auto' }];
             // single DDR TV films are listed as a "series" with one part
             const one = cat.ddr.find(x => names.includes(norm(x.t)) && (x.folgen || []).length === 1);
-            if (one) return [{ name: 'dailyme · Deutsch · DDR TV-Archiv', title: one.t, url: one.folgen[0].v, quality: 'auto' }];
+            if (one) return [{ name: 'dailyme · Deutsch · dailyme', title: one.t, url: one.folgen[0].v, quality: 'auto' }];
             return [];
         }
         if (!season || !episode) return [];
@@ -61,7 +61,7 @@ async function getStreams(tmdbId, type, season, episode) {
         const s = cat.ddr.find(x => names.includes(norm(x.t)));
         if (!s) return [];
         const ep = (s.folgen || []).find(f => Number(f.s || 1) === Number(season) && Number(f.f) === Number(episode));
-        return ep && ep.v ? [{ name: 'dailyme · Deutsch · DDR TV-Archiv', title: `${s.t} · ${ep.t || 'Folge ' + ep.f}`, url: ep.v, quality: 'auto' }] : [];
+        return ep && ep.v ? [{ name: 'dailyme · Deutsch · dailyme', title: `${s.t} · ${ep.t || 'Folge ' + ep.f}`, url: ep.v, quality: 'auto' }] : [];
     } catch (e) {
         console.error(`[dailyme] ${e.message}`);
         return [];

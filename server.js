@@ -272,9 +272,9 @@ function toAddonStream(s, provider, ctx) {
         const head = meta.title ? (ctx.season != null ? `${meta.title} S${pad2(ctx.season)} ･ E${pad2(ctx.episode)}` : meta.title) : '';
         const out = {
             name: RES_LABEL('auto'),
-            title: [head, `▫ ${parts[0]}${parts[2] ? ' · ' + parts[2] : ''}`, `▫ ${key === 'de' ? '🇩🇪 German' : '🌐 ' + (LANG_EN[lang] || lang)}`].filter(Boolean).join('\n'),
+            title: [head, `▫ ${parts[2] || 'YouTube'}`, `▫ ${key === 'de' ? '🇩🇪 German' : '🌐 ' + (LANG_EN[lang] || lang)}`].filter(Boolean).join('\n'),
             ytId: s.ytId,
-            behaviorHints: { bingeGroup: `german-providers-${provider.id}-${key}`, filename: releaseName(meta, ctx, 'auto', s, key, lang, parts[0], parts[2] || 'YouTube') },
+            behaviorHints: { bingeGroup: `german-providers-${provider.id}-${key}`, filename: releaseName(meta, ctx, 'auto', s, key, lang, '', parts[2] || 'YouTube') },
         };
         out.description = out.title;
         return { rank: RANK[key], q: 2, label: parts.join(' '), stream: out };
@@ -295,14 +295,14 @@ function toAddonStream(s, provider, ctx) {
     const langText = key === 'de' ? '🇩🇪 German' : key === 'de-sub' ? '🇩🇪 German subs' : `🌐 ${LANG_EN[lang] || lang}`;
     const out = {
         name: RES_LABEL(`${quality} ${s.name || ''}`),
-        title: [head, `▫ ${parts[0]}${hostText && hostText !== parts[0] ? ' · ' + hostText : ''}`, `▫ ${langText}`].filter(Boolean).join('\n'),
+        title: [head, `▫ ${hostText || parts[0]}`, `▫ ${langText}`].filter(Boolean).join('\n'),
         url,
         behaviorHints: {
             // same group on every episode -> Nuvio/Stremio pick this addon again for the next episode
             // per provider: start on Huhu and the next episode stays on Huhu (only falls back if Huhu has nothing)
             bingeGroup: `german-providers-${provider.id}-${key}`,
             // release-style name: Nuvio's badge rules read it (resolution, language); only facts we really know
-            filename: releaseName(meta, ctx, quality, s, key, lang, parts[0], hostText),
+            filename: releaseName(meta, ctx, quality, s, key, lang, '', hostText || parts[0]),
             notWebReady: !!headers || undefined,
             proxyHeaders: headers ? { request: headers } : undefined,
         },
@@ -704,7 +704,7 @@ async function runAudit(audit) {
 function addonManifest() {
     return {
         id: 'community.german-providers.addon',
-        version: '1.16.0',
+        version: '1.16.1',
         name: 'German Providers',
         description: `Deutsche Quellen (s.to, AniWorld, ARD, Arte, FilmPalast …) als Addon. Plugins v${pluginVersion} von InvalidPandaa/nuvio-german-providers (GPL-3.0).`,
         logo: publicBase ? `${publicBase}/logo.png` : 'https://flagcdn.com/w160/de.png',
