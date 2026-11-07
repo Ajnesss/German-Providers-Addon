@@ -287,7 +287,8 @@ function toAddonStream(s, provider, ctx) {
     let headers = s.headers && Object.keys(s.headers).length ? s.headers : null;
     let url = s.url;
     // hosts like VOE only play on the connection that found the link: pass those through this server
-    if (publicBase && passthrough.wanted(s, parts.join(' '), provider.id)) {
+    // German sources that only play inside Germany always go through this server (even if listed as 'direct')
+    if (publicBase && (FORCE_THROUGH.includes(provider.id) || passthrough.wanted(s, parts.join(' '), provider.id))) {
         const source = ((`${parts.join(' ')} ${s.title || ''}`).match(/\b([a-z0-9-]+\.(?:[a-z0-9-]+\.)*[a-z]{2,})\b/i) || [])[1];
         const host = (parts[2] || source || '').toLowerCase();
         const re = ctx ? [ctx.type, ctx.id, provider.id, host] : null;
@@ -733,7 +734,7 @@ async function runAudit(audit) {
 function addonManifest() {
     return {
         id: 'community.german-providers.addon',
-        version: '1.18.0',
+        version: '1.18.1',
         name: 'German Providers',
         description: `Deutsche Quellen (s.to, AniWorld, ARD, Arte, FilmPalast …) als Addon. Plugins v${pluginVersion} von InvalidPandaa/nuvio-german-providers (GPL-3.0).`,
         logo: publicBase ? `${publicBase}/logo.png` : 'https://flagcdn.com/w160/de.png',
