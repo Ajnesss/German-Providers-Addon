@@ -43,23 +43,8 @@ ENV
 echo "https://$HOST/manifest.json" > /opt/gpa-address.txt
 
 # 4. build and start the addon (restarts by itself after crashes and reboots)
-cat > /usr/local/bin/gpa-deploy <<'DEPLOY'
-#!/bin/bash
-# rebuilds the addon from GitHub when there is a new commit (or with "force")
-cd /opt/gpa || exit 1
-OLD=$(git rev-parse HEAD)
-git fetch -q --depth 1 origin && git reset -q --hard origin/HEAD
-NEW=$(git rev-parse HEAD)
-if [ "$OLD" != "$NEW" ] || [ "$1" = "force" ] || ! docker ps --format '{{.Names}}' | grep -qx addon; then
-  echo "$(date) deploying $NEW"
-  docker build -t gpa /opt/gpa && {
-    docker rm -f addon 2>/dev/null
-    docker run -d --name addon --restart always --env-file /opt/gpa.env -p 127.0.0.1:8000:8000 gpa
-    docker image prune -f >/dev/null
-  }
-fi
-DEPLOY
-chmod +x /usr/local/bin/gpa-deploy
+# (the deploy script is part of the repository and keeps itself up to date)
+install -m 755 /opt/gpa/deploy/gpa-deploy.sh /usr/local/bin/gpa-deploy
 /usr/local/bin/gpa-deploy force
 
 # 5. https in front of it (Caddy gets a free certificate for the sslip.io name)

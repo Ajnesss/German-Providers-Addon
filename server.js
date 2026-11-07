@@ -806,8 +806,13 @@ async function notifyRun() {
     log(`notify check: SerienStream ${st.sto}, providers ${JSON.stringify(Object.fromEntries(Object.entries(st.providers).map(([k, v]) => [k, v.n])))}`);
 }
 if (process.env.NOTIFY !== '0' && require.main === module) {
-    setTimeout(() => notifyRun().catch(e => log(`notify: ${e.message}`)), 15 * 60000).unref();
-    setInterval(() => notifyRun().catch(e => log(`notify: ${e.message}`)), 24 * 3600 * 1000).unref();
+    // daily, counted from the last check (kept across updates), at the earliest 15 minutes after a start
+    const daily = () => {
+        const last = Date.parse(require('./notify.js').state.lastRun || '') || 0;
+        const wait = last ? Math.max(15 * 60000, last + 24 * 3600 * 1000 - Date.now()) : 15 * 60000;
+        setTimeout(() => notifyRun().catch(e => log(`notify: ${e.message}`)).then(daily), wait).unref();
+    };
+    daily();
 }
 
 const server = http.createServer(async (req, res) => {
@@ -1063,6 +1068,14 @@ if (require.main === module) {
         })();
     }
     server.listen(PORT, () => log(`German Providers addon on http://localhost:${PORT}/manifest.json`));
+    // an update stops the container: keep what s.to answered and the notification state before going
+    for (const sig of ['SIGTERM', 'SIGINT']) process.once(sig, () => {
+        log(`${sig}: saving state, stopping`);
+        try { require('./sto-access.js')._save(); } catch (e) {}
+        try { require('./notify.js').save(); } catch (e) {}
+        server.close();
+        setTimeout(() => process.exit(0), 1500).unref();
+    });
     net.startWarpWatch();
     if (AUTO_UPDATE) { update(); setInterval(update, UPDATE_HOURS * 3600000).unref(); }
 }

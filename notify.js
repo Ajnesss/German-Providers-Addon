@@ -10,6 +10,12 @@ const crypto = require('crypto');
 const NTFY = (process.env.NTFY_SERVER || 'https://ntfy.sh').replace(/\/$/, '');
 let topic = process.env.NTFY_TOPIC || null;
 const state = { lastRun: null, sto: 'unknown', stoFails: 0, providers: {}, sent: [] };
+// kept across updates (the server's state folder survives rebuilds), so a provider that broke during an update
+// is still noticed and the daily rhythm doesn't restart with every upload
+const fs = require('fs'), path = require('path'), os = require('os');
+const FILE = path.join(process.env.STATE_DIR || path.join(os.homedir(), '.german-addon'), 'notify-state.json');
+try { Object.assign(state, JSON.parse(fs.readFileSync(FILE, 'utf8'))); } catch (e) {}
+function save() { try { fs.mkdirSync(path.dirname(FILE), { recursive: true }); fs.writeFileSync(FILE, JSON.stringify(state)); } catch (e) {} }
 
 async function getTopic() {
     if (topic) return topic;
@@ -24,6 +30,7 @@ async function send(title, message, tags = 'warning') {
     const r = await f(`${NTFY}/${t}`, { method: 'POST', body: message, headers: { Title: title, Tags: tags, Priority: tags === 'warning' ? '4' : '3' }, signal: AbortSignal.timeout(15000) });
     state.sent.unshift(`${new Date().toISOString()} ${title}`);
     state.sent.length = Math.min(state.sent.length, 10);
+    save();
     return r.ok;
 }
 
@@ -65,7 +72,8 @@ async function run(checks, log = () => {}) {
         if (down.length) await send(`Provider stopped working: ${down.join(', ')}`, `${down.join(', ')} gave no working stream for the test titles today (they did before): nothing found, or nothing that plays. Ask Claude to look at it.`);
         if (back.length) await send(`Provider working again: ${back.join(', ')}`, `${back.join(', ')} gives working streams again.`, 'white_check_mark');
     } catch (e) { log(`notify: provider check failed: ${e.message}`); }
+    save();
     return state;
 }
 
-module.exports = { run, send, getTopic, state };
+module.exports = { run, send, getTopic, state, save };

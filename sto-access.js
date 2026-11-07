@@ -308,7 +308,6 @@ function init(d) {
     deps = d;
     load();
     plan();
-    process.once('SIGTERM', () => { save(); });
 }
 
 function availability(hours) {
