@@ -88,6 +88,9 @@ function loadPlugin(file) {
     // Huhu moved to the open mHub v2 protocol: its old endpoint is gone, the plugin asks the new one instead
     if (process.env.HUHU_V2 !== '0' && code.includes('mediaurl-source.json') && /^function sources\(/m.test(code))
         code += require('./huhu-v2.js').PATCH;
+    // AniWorld films: stricter matching (no film of another series because of a generic word)
+    if (process.env.AW_FILMS !== '0' && code.includes('var BASE = "https://aniworld.to"') && /^function findMovie\(/m.test(code))
+        code += require('./aniworld-films.js').PATCH;
     // let the SerienStream hand-off use the plugins' host readers (VOE, Dood, Filemoon, ...)
     if (/^function resolveEmbed\(/m.test(code)) code += '\n;try { module.exports.__resolveEmbed = resolveEmbed; } catch (e) {}\n';
     const m = new Module(file, module);
@@ -728,7 +731,7 @@ async function runAudit(audit) {
 function addonManifest() {
     return {
         id: 'community.german-providers.addon',
-        version: '1.17.1',
+        version: '1.17.2',
         name: 'German Providers',
         description: `Deutsche Quellen (s.to, AniWorld, ARD, Arte, FilmPalast …) als Addon. Plugins v${pluginVersion} von InvalidPandaa/nuvio-german-providers (GPL-3.0).`,
         logo: publicBase ? `${publicBase}/logo.png` : 'https://flagcdn.com/w160/de.png',
