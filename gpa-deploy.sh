@@ -13,8 +13,10 @@ git fetch -q --depth 1 origin && git reset -q --hard origin/HEAD
 NEW=$(git rev-parse HEAD)
 
 # 1. keep this script itself up to date
-if [ -f /opt/gpa/deploy/gpa-deploy.sh ] && ! cmp -s /opt/gpa/deploy/gpa-deploy.sh "$SELF"; then
-  install -m 755 /opt/gpa/deploy/gpa-deploy.sh "$SELF"
+SRC=/opt/gpa/deploy/gpa-deploy.sh
+[ -f "$SRC" ] || SRC=/opt/gpa/gpa-deploy.sh        # the file may also sit in the main folder of the repository
+if [ -f "$SRC" ] && ! cmp -s "$SRC" "$SELF"; then
+  install -m 755 "$SRC" "$SELF"
   echo "$(date) deploy script updated"
   exec "$SELF" force
 fi

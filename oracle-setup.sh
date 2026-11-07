@@ -44,7 +44,7 @@ echo "https://$HOST/manifest.json" > /opt/gpa-address.txt
 
 # 4. build and start the addon (restarts by itself after crashes and reboots)
 # (the deploy script is part of the repository and keeps itself up to date)
-install -m 755 /opt/gpa/deploy/gpa-deploy.sh /usr/local/bin/gpa-deploy
+install -m 755 "$( [ -f /opt/gpa/deploy/gpa-deploy.sh ] && echo /opt/gpa/deploy/gpa-deploy.sh || echo /opt/gpa/gpa-deploy.sh )" /usr/local/bin/gpa-deploy
 /usr/local/bin/gpa-deploy force
 
 # 5. https in front of it (Caddy gets a free certificate for the sslip.io name)

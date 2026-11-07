@@ -48,7 +48,67 @@ let deps = null;            // { nativeFetch, smartFetch, trace, plainHeaders, s
 let timer = null;
 const recoverHooks = [];
 
-const isStoHost = h => /(^|\.)(serienstream\.(to|cx)|s\.to)$/i.test(String(h || '').replace(/^www\./, '')) || (process.env.STO_TEST_HOST && h === process.env.STO_TEST_HOST);
+// SerienStream's own addresses (the site lists them on serien.domains). Both are the same service: same pages, same
+// play links, and your login works on both. Only HTTPS addresses with a valid certificate are used; the bare IP
+// (186.2.175.5) has no valid certificate and s.to no longer exists, so neither is in the list.
+// The first one is used normally; the second only while the first can't be reached (not because of the human check:
+// that is s.to's decision about the visitor, and switching address to avoid it would be dodging it).
+const DOMAINS = (process.env.STO_DOMAINS || 'https://serienstream.to,https://serienstream.cx').split(',').map(x => new URL(x.trim()).origin);
+const domainHosts = DOMAINS.map(o => new URL(o).host);
+const dom = { active: 0, fails: 0, firstFail: 0, switchedAt: 0, lastBackTry: 0, info: DOMAINS.map(o => ({ origin: o, lastOk: 0, lastFail: 0, lastError: null })) };
+const BACK_TRY_MS = (Number(process.env.STO_BACK_MINUTES) || 30) * MIN;
+const isStoHost = h => /(^|\.)(serienstream\.(to|cx)|s\.to)$/i.test(String(h || '').replace(/^www\./, '')) || domainHosts.includes(h) || (process.env.STO_TEST_HOST && h === process.env.STO_TEST_HOST);
+// the same request on the address in use right now
+function onActive(url) {
+    const u = new URL(url);
+    if (!domainHosts.includes(u.host)) return url;
+    const a = new URL(DOMAINS[dom.active]);
+    u.protocol = a.protocol; u.host = a.host;
+    return u.href;
+}
+const keyOf = url => { const u = new URL(url); return domainHosts.includes(u.host) ? u.pathname + u.search : url; };   // same entry on every address
+function domainOk(url) { const i = domainHosts.indexOf(new URL(url).host); if (i >= 0) { dom.info[i].lastOk = Date.now(); if (i === dom.active) { dom.fails = 0; } } }
+// the address in use failed to answer (no connection, timeout, server error): after 2 such failures within
+// 5 minutes, check the other address with one page request and switch if it answers properly
+async function domainFailed(url, why) {
+    const i = domainHosts.indexOf(new URL(url).host);
+    if (i < 0) return false;
+    Object.assign(dom.info[i], { lastFail: Date.now(), lastError: String(why).slice(0, 120) });
+    if (i !== dom.active || DOMAINS.length < 2) return false;
+    if (Date.now() - dom.firstFail > 5 * MIN) { dom.firstFail = Date.now(); dom.fails = 0; }
+    if (++dom.fails < 2) return false;
+    for (let j = 0; j < DOMAINS.length; j++) {
+        if (j === dom.active) continue;
+        if (await answersProperly(DOMAINS[j])) {
+            event('address-switched', { from: DOMAINS[dom.active], to: DOMAINS[j], reason: String(why).slice(0, 120) });
+            dom.active = j; dom.fails = 0; dom.switchedAt = Date.now();
+            return true;
+        }
+    }
+    return false;
+}
+// one page request: does this address answer with the site, logged in?
+async function answersProperly(origin) {
+    try {
+        await slot();
+        let r;
+        try {
+            const cookie = deps.session.forHost(new URL(origin).host);
+            note('address-test');
+            r = await deps.nativeFetch(origin + '/account', { headers: { 'User-Agent': UA, Cookie: origin.startsWith('https:') || process.env.STO_TEST_HOST ? cookie : '' }, redirect: 'manual', signal: AbortSignal.timeout(15000) });
+        } finally { release(); }
+        const ok = r.status === 200 && /Abmelden|logout/i.test(await r.text());
+        const i = DOMAINS.indexOf(origin);
+        if (ok) dom.info[i].lastOk = Date.now(); else Object.assign(dom.info[i], { lastFail: Date.now(), lastError: `HTTP ${r.status}` });
+        return ok;
+    } catch (e) { const i = DOMAINS.indexOf(origin); Object.assign(dom.info[i], { lastFail: Date.now(), lastError: e.message }); return false; }
+}
+// while on the second address: every 30 minutes, see if the first one is back
+async function tryBack() {
+    if (dom.active === 0 || Date.now() - dom.lastBackTry < BACK_TRY_MS) return;
+    dom.lastBackTry = Date.now();
+    if (await answersProperly(DOMAINS[0])) { event('address-switched', { from: DOMAINS[dom.active], to: DOMAINS[0], reason: 'main address answers again' }); dom.active = 0; dom.fails = 0; }
+}
 function kindOf(u) {
     const p = u.pathname;
     if (/^\/r\b/.test(p)) return 'play';
@@ -170,6 +230,13 @@ const skipped = url => { const out = new Response('s.to check active', { status:
 
 async function stoFetch(url, opts = {}) {
     const d = deps;
+    tryBack().catch(() => {});
+    url = onActive(url);
+    if (opts.headers) {
+        const h = d.plainHeaders(opts.headers);
+        for (const k of Object.keys(h)) if (k.toLowerCase() === 'referer' && h[k]) { try { h[k] = onActive(h[k]); } catch (e) {} }
+        opts = Object.assign({}, opts, { headers: h });
+    }
     const u = new URL(url);
     const kind = kindOf(u);
     const method = String(opts.method || 'GET').toUpperCase();
@@ -177,13 +244,13 @@ async function stoFetch(url, opts = {}) {
 
     if (kind === 'play' && !probing) {
         // 1. this link was answered before: go straight to the hoster page
-        const known = links.get(url);
+        const known = links.get(keyOf(url));
         if (known && known.until > Date.now()) {
             st.served.linkMemory++;
             d.trace({ url, route: 'node+login', status: 302, ms: 0, snippet: `-> ${known.loc} (remembered)`.slice(0, 200) });
             const r = await d.smartFetch(known.loc, Object.assign({}, opts, { headers: noCookie(opts.headers, d), _hops: (opts._hops || 0) + 1 }));
             if (r.status !== 404 && r.status !== 410) return r;
-            links.delete(url);            // the hoster dropped the video: ask s.to for this link again
+            links.delete(keyOf(url));            // the hoster dropped the video: ask s.to for this link again
         }
         // 2. s.to shows its check: don't ask again, except now and then when someone actually wants to watch
         if (st.state !== 'ok') {
@@ -196,21 +263,21 @@ async function stoFetch(url, opts = {}) {
         }
     }
     if (method === 'GET' && PAGE_MS[kind] && !probing) {
-        const c = pages.get(url);
+        const c = pages.get(keyOf(url));
         if (c && c.until > Date.now()) { st.served.cache++; d.trace({ url, route: 'node+login', status: c.status, ms: 0, snippet: '(page remembered)' }); return fromCache(c, url); }
-        if (inflight.has(url)) { st.served.cache++; return fromCache(await inflight.get(url), url); }
+        if (inflight.has(keyOf(url))) { st.served.cache++; return fromCache(await inflight.get(keyOf(url)), url); }
         const job = send(url, opts, kind).then(async r => {
             const body = await r.text();
             const c = { at: Date.now(), until: Date.now() + PAGE_MS[kind], status: r.status, url: r.url, type: r.headers.get('content-type'), body };
             // only proper pages are reused (not errors, not a page without the login)
             if (r.status === 200 && body.length > 2000 && /Abmelden|logout/i.test(body)) {
-                pages.set(url, c);
+                pages.set(keyOf(url), c);
                 if (pages.size > 600) pages.delete(pages.keys().next().value);
             }
             return c;
         });
-        inflight.set(url, job);
-        try { return fromCache(await job, url); } finally { inflight.delete(url); }
+        inflight.set(keyOf(url), job);
+        try { return fromCache(await job, url); } finally { inflight.delete(keyOf(url)); }
     }
     return send(url, opts, kind);
 }
@@ -227,7 +294,8 @@ async function send(url, opts, kind) {
     let r, t = Date.now();
     try {
         const hh = d.plainHeaders(opts.headers);
-        const cookie = d.session.forHost(new URL(url).host);
+        // the login only ever travels over HTTPS
+        const cookie = new URL(url).protocol === 'https:' || process.env.STO_TEST_HOST ? d.session.forHost(new URL(url).host) : '';
         const ck = Object.keys(hh).find(k => k.toLowerCase() === 'cookie');
         if (cookie) hh[ck || 'Cookie'] = ck && hh[ck] ? `${hh[ck]}; ${cookie}` : cookie;
         note(kind);
@@ -236,10 +304,14 @@ async function send(url, opts, kind) {
         r = await d.nativeFetch(url, Object.assign({}, opts, { headers: hh, redirect: 'manual', signal: opts.signal || AbortSignal.timeout(20000) }));
     } catch (e) {
         release();
+        if (!opts._stoRetried && await domainFailed(url, e.message)) return send(onActive(url), Object.assign({}, opts, { _stoRetried: true }), kind);
         if (kind === 'play' || opts._stoProbe) markUnreachable(e.message);
         throw e;
     }
     release();
+    if (r.status >= 500 || r.status === 429) {
+        if (r.status !== 429 && !opts._stoRetried && await domainFailed(url, `HTTP ${r.status}`)) return send(onActive(url), Object.assign({}, opts, { _stoRetried: true }), kind);
+    } else domainOk(url);
     try { d.session.update(typeof r.headers.getSetCookie === 'function' ? r.headers.getSetCookie() : [r.headers.get('set-cookie')].filter(Boolean)); } catch (e) {}
     const loc = r.status >= 300 && r.status < 400 && r.headers.get('location');
     d.trace({ url, route: 'node+login', status: r.status, ms: Date.now() - t, snippet: loc ? `-> ${loc}`.slice(0, 200) : undefined });
@@ -247,7 +319,7 @@ async function send(url, opts, kind) {
     if (kind === 'play') {
         const target = loc && new URL(loc, url).href;
         if (target && !isStoHost(new URL(target).host)) {
-            links.set(url, { loc: target, at: Date.now(), until: Date.now() + LINK_MS });
+            links.set(keyOf(url), { loc: target, at: Date.now(), until: Date.now() + LINK_MS });
             if (links.size > 20000) links.delete(links.keys().next().value);
             markOk();
             saveSoon();
@@ -281,7 +353,7 @@ function save() {
 function load() {
     try {
         const s = JSON.parse(fs.readFileSync(STATE_FILE, 'utf8'));
-        for (const [k, v] of s.links || []) if (v.until > Date.now()) links.set(k, v);
+        for (const [k, v] of s.links || []) if (v.until > Date.now()) links.set(/^https?:/.test(k) ? keyOf(k) : k, v);   // older saves used full addresses
         for (const e of s.events || []) events.push(e);
         for (const [k, v] of s.lastGood || []) if (Date.now() - v.at < LAST_GOOD_MS) lastGood.set(k, v);
     } catch (e) {}
@@ -334,6 +406,7 @@ function status() {
         availabilityPercent: { '24h': availability(24), '7d': availability(168) },
         sentToSto: { '5min': sentWithin(5), '60min': sentWithin(60), '24h': sentWithin(1440) },
         answeredWithoutAsking: st.served, remembered: { playLinks: links.size, pages: pages.size, episodes: lastGood.size },
+        addresses: { inUse: DOMAINS[dom.active], list: dom.info.map(x => ({ address: x.origin, lastAnswered: x.lastOk ? new Date(x.lastOk).toISOString() : null, lastFailed: x.lastFail ? new Date(x.lastFail).toISOString() : null, lastError: x.lastError })) },
         recentEvents: events.slice(-15),
     };
 }

@@ -70,6 +70,7 @@ function update(setCookieLines) {
     cookie = [...jar].map(([k, v]) => `${k}=${v}`).join('; ');
 }
 
-const forHost = host => (cookie && (HOSTS.test(String(host || '').replace(/^www\./, '')) || (process.env.STO_TEST_HOST && host === process.env.STO_TEST_HOST))) ? cookie : '';
+const extraHosts = () => (process.env.STO_DOMAINS || '').split(',').filter(Boolean).map(x => { try { return new URL(x.trim()).host; } catch (e) { return ''; } });
+const forHost = host => (cookie && (HOSTS.test(String(host || '').replace(/^www\./, '')) || (process.env.STO_TEST_HOST && host === process.env.STO_TEST_HOST) || extraHosts().includes(host))) ? cookie : '';
 
 module.exports = { keyOfMachine, load, set, update, forHost, status: () => ({ loggedIn: !!cookie, source, names: cookie ? cookie.split('; ').map(x => x.split('=')[0]) : [] }), HOSTS, _clean: clean };
