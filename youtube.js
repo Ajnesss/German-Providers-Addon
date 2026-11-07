@@ -2,7 +2,9 @@
 // von TOGGO"), through the YouTube Data API v3. The stream is handed to Nuvio as a YouTube id ("ytId"), which the
 // app plays in its own player. Only channels whose name carries the series name AND "Deutsch"/"offiziell" count,
 // and only videos whose title contains the episode's German title and whose length fits one episode (no clips,
-// no hour-long compilations). Series only: free films on YouTube are too often unofficial uploads to trust.
+// no hour-long compilations).
+// Films: only from a short list of channels that publish licensed full films in German (the rights holders' own
+// uploads, marked as licensed content by YouTube), never from anyone else.
 //
 // Quota (10,000 units a day, free): finding a show's channel costs ~100 once a week, its episode list a few units a
 // day; matching an episode costs nothing extra.
@@ -13,6 +15,11 @@
 const KEY = (process.env.YT_API_KEY || 'AIzaSyBMufKaUnMoKQbd9j4Lj3DeEvLMe7caUBU').trim();
 const API = process.env.YT_API || 'https://www.googleapis.com/youtube/v3';
 const MAX_PAGES = Number(process.env.YT_MAX_PAGES) || 30;          // 50 videos per page
+// channels with licensed full German films (YouTube marks their films as licensed content). Netzkino's own channel
+// is not needed: its films come straight from Netzkino (netzkino-v2.js).
+const FILM_CHANNELS = (process.env.YT_FILM_CHANNELS || 'UClyuw-OWE6taGFv0reZI6eQ:CiNENET,UCh4JH8axA_jUjB8YoRnm0cg:Moviedome,UCSKbHQcEk-42lL--03lbbIw:DEFA Filmwelt')
+    .split(',').map(x => { const [id, ...n] = x.split(':'); return { id: id.trim(), title: n.join(':').trim() || id.trim() }; }).filter(c => /^UC/.test(c.id));
+const FILM_PAGES = Number(process.env.YT_FILM_PAGES) || 80;
 // Nuvio plays YouTube videos on the TV itself, so a video has to be allowed in the viewer's country. Many German
 // channels (TOGGO, ...) only allow Germany/Austria/Switzerland: those are left out for a viewer elsewhere.
 const REGION = (process.env.YT_REGION || 'GB').toUpperCase();
@@ -57,11 +64,11 @@ async function channelFor(names) {
 }
 
 // every upload of a channel with its length: [{ id, title, sec }]
-async function uploads(channelId) {
+async function uploads(channelId, pages = MAX_PAGES) {
     return cached(`up:${channelId}`, DAY, async () => {
         const list = [];
         let page = '';
-        for (let i = 0; i < MAX_PAGES; i++) {
+        for (let i = 0; i < pages; i++) {
             let d;
             try {
                 d = await fetchJson(`${API}/playlistItems?part=snippet,contentDetails&maxResults=50&playlistId=UU${channelId.slice(2)}${page ? '&pageToken=' + page : ''}&key=${KEY}`);
@@ -83,6 +90,7 @@ async function uploads(channelId) {
                 v.sec = seconds(c.duration);
                 v.allowed = r.allowed || null;
                 v.blocked = r.blocked || null;
+                v.licensed = !!c.licensedContent;
             });
         }
         return list.filter(v => v.id && v.sec);
@@ -103,7 +111,30 @@ function pick(videos, epName, runtimeMin) {
         .sort((a, b) => a.sec - b.sec)[0] || null;
 }
 
+// a film on one of the film channels: its title contains the film's German (or original) title, it is about as long
+// as the film, YouTube marks it as licensed, and it can be played in the viewer's country
+async function filmStreams(tmdbId) {
+    const d = await tmdb(`movie/${tmdbId}?language=de-DE&append_to_response=alternative_titles`);
+    const alts = ((d.alternative_titles || {}).titles || []).filter(a => a.iso_3166_1 === 'DE' || a.iso_3166_1 === 'AT').map(a => a.title);
+    const names = [d.title, d.original_title].concat(alts).filter((n, i, a) => n && n.length >= 3 && a.indexOf(n) === i);
+    const rt = (Number(d.runtime) || 0) * 60;
+    const year = String(d.release_date || '').slice(0, 4);
+    const yearOk = t => { const ys = String(t).match(/\b(19|20)\d{2}\b/g); return !year || !ys || ys.some(y => Math.abs(+y - +year) <= 1); };
+    const out = [];
+    for (const ch of FILM_CHANNELS) {
+        const list = await uploads(ch.id, FILM_PAGES).catch(e => { console.error(`[YouTube] ${ch.title}: ${e.message}`); return []; });
+        const v = list.filter(x => x.licensed && playableHere(x) && x.sec >= 45 * 60 && !NOT_EPISODE.test(x.title) && yearOk(x.title)
+                && names.some(n => has(x.title, n)) && (!rt || Math.abs(x.sec - rt) <= Math.max(12 * 60, rt * 0.15)))
+            .sort((a, b) => Math.abs(a.sec - rt) - Math.abs(b.sec - rt))[0];
+        if (v) out.push({ name: `YouTube · Deutsch · ${ch.title}`, title: v.title, ytId: v.id, quality: 'auto' });
+    }
+    return out;
+}
+
 async function getStreams(tmdbId, type, season, episode) {
+    if (KEY && type === 'movie') {
+        try { return await filmStreams(tmdbId); } catch (e) { console.error(`[YouTube] ${e.message}`); return []; }
+    }
     if (!KEY || type !== 'tv' || !season || !episode) return [];
     try {
         const show = await tmdb(`tv/${tmdbId}?language=de-DE`);
@@ -122,4 +153,7 @@ async function getStreams(tmdbId, type, season, episode) {
     }
 }
 
-module.exports = { getStreams, pick, seconds, norm, has, playableHere };
+// load the film channels' lists in the background, so the first film request doesn't wait for them (once a day)
+async function warm() { for (const ch of FILM_CHANNELS) await uploads(ch.id, FILM_PAGES).catch(e => console.error(`[YouTube] ${ch.title}: ${e.message}`)); }
+
+module.exports = { getStreams, pick, seconds, norm, has, playableHere, warm };

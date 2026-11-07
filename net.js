@@ -134,6 +134,14 @@ async function smartFetch(input, opts = {}) {
     const url = typeof input === 'string' ? input : (input && input.url) || String(input);
     if (!/^https?:/i.test(url)) return nativeFetch(input, opts);
     const host = hostOf(url);
+    // a video page that said "file not found" a moment ago: it stays gone, don't ask again (on any route or mirror)
+    const deadUntil = deadLinks.get(url);
+    if (deadUntil && deadUntil > Date.now() && !opts._recheck) {
+        trace({ url, route: 'skip', status: 404, ms: 0, snippet: 'file not found earlier (remembered)' });
+        const out = new Response('file not found (remembered)', { status: 404 });
+        Object.defineProperty(out, 'url', { value: url });
+        return out;
+    }
     if ((down.get(host) || 0) > Date.now()) {
         trace({ url, route: 'skip', status: 522, ms: 0, snippet: 'host down a moment ago, not waiting again' });
         const out = new Response('host down', { status: 522, statusText: 'host down (remembered)' });
@@ -167,6 +175,8 @@ async function smartFetch(input, opts = {}) {
             const blocked = isBlocked(r.status, r.headers.get('content-type'), r.buf);
             trace({ url, route, status: r.status, blocked, bytes: r.buf.byteLength, ms: Date.now() - t, snippet: snippet(r.headers.get('content-type'), r.buf) });
             if (blocked) { count(host, route, 'blocked'); sawBlock = true; last = r; continue; }
+            // the host's own "this file doesn't exist" page is final: no other route or mirror will find it
+            if (isVideoPage(url) && goneFor(r)) { count(host, route, 'ok'); rememberDead(url); rememberDead(r.url); return toResponse(r); }
             // after a block, a 404 is often a fake "not found" for servers: try the remaining routes too
             if (r.status === 404 && sawBlock) { count(host, route, 'blocked'); candidate = candidate || r; continue; }
             if (r.status >= 520 && r.status <= 526) markDown(host, Date.now() - started);
@@ -187,6 +197,8 @@ async function smartFetch(input, opts = {}) {
             lastErr = e;
             // a slow site stays slow on every route: don't spend another 20 s per route on it
             if (isTimeout(e) && !sawBlock) { markDown(host, Date.now() - started); break; }
+            // a broken certificate or a refused connection is the same on every route
+            if (/certificate|InvalidCertificate|ECONNREFUSED|ENOTFOUND|EAI_AGAIN/i.test(String(e && e.message || e)) && !sawBlock) { markDown(host, Date.now() - started); break; }
         }
     }
     // a host that blocks every route: hosts like DoodStream run mirror domains with the same files, try those
@@ -203,6 +215,24 @@ async function smartFetch(input, opts = {}) {
     if (candidate) return toResponse(candidate);
     if (last) { const out = toResponse(last); if (sawBlock && opts._mirror) out.headers.set('x-still-blocked', '1'); return out; }
     throw lastErr || new Error(`fetch failed for ${url}`);
+}
+
+// video pages whose host said the file doesn't exist: remembered for 12 hours
+const deadLinks = new Map();
+const DEAD_MS = (Number(process.env.DEAD_LINK_HOURS) || 12) * 3600 * 1000;
+const GONE = /<title>[^<]*(file not found|video not found|file was deleted|file is no longer available|video is not available|datei nicht gefunden|not found \| )[^<]*<\/title>|<h\d[^>]*>\s*(file not found|video not found)\s*</i;
+function goneFor(r) {
+    if (!(r.status === 404 || r.status === 410 || r.status === 200)) return false;
+    if (!r.buf || r.buf.byteLength > 60000 || !/html/i.test(r.headers.get('content-type') || 'text/html')) return r.status === 410;
+    const head = Buffer.from(r.buf).toString('utf8', 0, Math.min(r.buf.byteLength, 8000));
+    return GONE.test(head);
+}
+// only video hosters' pages (…/e/<id>, …/d/<id>, …/w/<id>, …/embed-<id>.html …), never a site's own pages
+const isVideoPage = u => /\/(e|d|w|v|f|embed|play)\/[A-Za-z0-9_-]{6,}|\/embed-[A-Za-z0-9]{6,}|\/[A-Za-z0-9]{8,}(\.html)?$/.test(String(u || '').replace(/[?#].*$/, '')) && !/serienstream|aniworld|s\.to\b/i.test(String(u || ''));
+function rememberDead(u) {
+    if (!u) return;
+    deadLinks.set(u, Date.now() + DEAD_MS);
+    if (deadLinks.size > 20000) deadLinks.delete(deadLinks.keys().next().value);
 }
 
 // mirror domains that serve the same files (DoodStream family)
@@ -299,4 +329,4 @@ const ipOf = route => (route === 'node' || route === 'direct') ? 'server' : rout
 function warpLog() { try { return require('fs').readFileSync('/tmp/warp.log', 'utf8').split('\n').filter(Boolean).slice(-25); } catch (e) { return ['no warp log']; } }
 
 let stoReady = false;
-module.exports = { stoInit: () => { const sto = require('./sto-session.js'); if (!stoReady && sto.status().loggedIn) { stoReady = true; require('./sto-access.js').init({ nativeFetch, smartFetch, trace, plainHeaders, session: sto }); } return stoReady; }, stoGated: () => stoReady && require('./sto-access.js').state() !== 'ok', stoStatus: () => require('./sto-access.js').status(), hasCookie: url => !!cookieHeader(url), rememberedRoute: host => { const m = memory.get(host); return m && m.until > Date.now() ? m.route : null; }, open, availableRoutes, peek, probe: (route, url, opts) => once(route, url, opts || {}, true), warpOn: () => warpUp, traceStore, smartFetch, nativeFetch, startWarpWatch, checkWarp, diag, ipOf, status: () => ({ down: Object.fromEntries([...down].filter(([, t]) => t > Date.now()).map(([h, t]) => [h, new Date(t).toISOString()])), warp: warpUp, warpLog: warpLog(), proxy: !!PROXY_URL, remembered: Object.fromEntries([...memory].map(([h, m]) => [h, m.route])), stats }) };
+module.exports = { stoInit: () => { const sto = require('./sto-session.js'); if (!stoReady && sto.status().loggedIn) { stoReady = true; require('./sto-access.js').init({ nativeFetch, smartFetch, trace, plainHeaders, session: sto }); } return stoReady; }, stoGated: () => stoReady && require('./sto-access.js').state() !== 'ok', stoStatus: () => require('./sto-access.js').status(), hasCookie: url => !!cookieHeader(url), rememberedRoute: host => { const m = memory.get(host); return m && m.until > Date.now() ? m.route : null; }, open, availableRoutes, peek, probe: (route, url, opts) => once(route, url, opts || {}, true), warpOn: () => warpUp, traceStore, smartFetch, nativeFetch, startWarpWatch, checkWarp, diag, ipOf, deadLinks: () => deadLinks.size, status: () => ({ deadLinks: [...deadLinks.values()].filter(t => t > Date.now()).length, down: Object.fromEntries([...down].filter(([, t]) => t > Date.now()).map(([h, t]) => [h, new Date(t).toISOString()])), warp: warpUp, warpLog: warpLog(), proxy: !!PROXY_URL, remembered: Object.fromEntries([...memory].map(([h, m]) => [h, m.route])), stats }) };

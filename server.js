@@ -112,6 +112,8 @@ function loadFrom(dir) {
             // FilmFrei24 rebuilt its site; while the plugin still reads the old page, use the new site API instead
             if (s.id === 'filmfrei24' && process.env.FF24_V2 !== '0' && fs.readFileSync(file, 'utf8').includes('ALL_FILMS'))
                 mod = require('./filmfrei24-v2.js');
+            // Netzkino: its old API is gone; the current one (with IMDb ids) is used instead
+            if (s.id === 'netzkino' && process.env.NETZKINO_V2 !== '0') mod = require('./netzkino-v2.js');
             if (typeof mod.getStreams !== 'function') throw new Error('no getStreams');
             list.push({ id: s.id, name: s.name, types: s.supportedTypes || [], mod, lock: Promise.resolve() });
         } catch (e) {
@@ -131,7 +133,7 @@ function loadFrom(dir) {
         list.push({ id: 'dailyme', name: 'dailyme', types: ['movie', 'tv'], mod: require('./dailyme.js'), lock: Promise.resolve() });
     // built in: full episodes on a series' official German YouTube channel (played by Nuvio's own YouTube player)
     if (!SKIP.includes('youtube') && (!ONLY.length || ONLY.includes('youtube')))
-        list.push({ id: 'youtube', name: 'YouTube', types: ['tv'], mod: require('./youtube.js'), lock: Promise.resolve() });
+        list.push({ id: 'youtube', name: 'YouTube', types: ['tv', 'movie'], mod: require('./youtube.js'), lock: Promise.resolve() });
     // built in: ZDF, 3sat, KiKA & the other public broadcasters' Mediatheken (films and series), via MediathekViewWeb
     if (!SKIP.includes('mediathek') && (!ONLY.length || ONLY.includes('mediathek')))
         list.push({ id: 'mediathek', name: 'Mediathek', types: ['movie', 'tv'], mod: require('./mvw.js'), lock: Promise.resolve() });
@@ -241,7 +243,7 @@ async function showMeta(pType, tmdbId) {
 }
 
 // always through the Frankfurt server, even when the host would allow direct play (Germany-only broadcasters)
-const FORCE_THROUGH = ['ardsoap', 'mediathek', 'wedotv', 'dailyme'];
+const FORCE_THROUGH = ['ardsoap', 'mediathek', 'wedotv', 'dailyme', 'netzkino'];
 function releaseName(meta, ctx, quality, s, key, lang, site, host) {
     const clean = t => String(t || '').normalize('NFD').replace(/[\u0300-\u036f]/g, '').replace(/ß/g, 'ss').replace(/[^A-Za-z0-9]+/g, '.').replace(/^\.+|\.+$/g, '');
     const qtext = `${quality} ${s.name || ''} ${s.title || ''}`;
@@ -731,7 +733,7 @@ async function runAudit(audit) {
 function addonManifest() {
     return {
         id: 'community.german-providers.addon',
-        version: '1.17.2',
+        version: '1.18.0',
         name: 'German Providers',
         description: `Deutsche Quellen (s.to, AniWorld, ARD, Arte, FilmPalast …) als Addon. Plugins v${pluginVersion} von InvalidPandaa/nuvio-german-providers (GPL-3.0).`,
         logo: publicBase ? `${publicBase}/logo.png` : 'https://flagcdn.com/w160/de.png',
@@ -1080,6 +1082,8 @@ if (require.main === module) {
         setTimeout(() => process.exit(0), 1500).unref();
     });
     net.startWarpWatch();
+    // YouTube film channels: fetch their lists after the start and then once a day
+    if (!SKIP.includes('youtube')) { const w = () => require('./youtube.js').warm().catch(() => {}); setTimeout(w, 3 * 60000).unref(); setInterval(w, 24 * 3600 * 1000).unref(); }
     if (AUTO_UPDATE) { update(); setInterval(update, UPDATE_HOURS * 3600000).unref(); }
 }
 
