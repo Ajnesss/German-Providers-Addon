@@ -259,7 +259,7 @@ const metaCache = new Map();   // "tv:123" -> { title, year }
 //   - AniWorld and SerienStream get "season 1, episode <position>": their plugins walk on through the site's own
 //     seasons when season 1 has fewer episodes (as the sites number them)
 //   - every other site gets TMDB's season and episode (Huhu and others look episodes up by TMDB numbering)
-// Only for Japanese animation, and only when IMDb's season sizes differ from TMDB's; everything else is unchanged.
+// Only for Japanese animation asked for with an IMDb id; other series are unchanged.
 const ABSOLUTE_SITES = ['aniworld', 'serienstream'];
 const numberingCache = new Map();
 async function cachedJson(url, ttl) {
@@ -272,28 +272,62 @@ async function cachedJson(url, ttl) {
     if (numberingCache.size > 500) numberingCache.delete(numberingCache.keys().next().value);
     return v;
 }
+// One rule for every anime site, worked out once per request (stream lookups and /debug/start use the same):
+//   - AniWorld and SerienStream: "season 1, episode <position in the whole series>"
+//   - Huhu and every other site: TMDB's season and episode (Huhu numbers by TMDB for tmdb: and imdb: ids alike)
+// When the episode can't be placed with certainty (IMDb's or TMDB's episode list couldn't be read, or the request
+// points past what IMDb lists in a season that isn't the newest one), no site is asked for this request, rather than
+// asked with numbers that might mean a different episode. That empty answer is kept for 2 minutes only.
 async function animeNumbering(imdbId, tmdbId, season, episode) {
     if (!season || !episode) return null;
     const show = await cachedJson(`https://api.themoviedb.org/3/tv/${tmdbId}?api_key=${TMDB_API_KEY}`, 12 * 3600 * 1000);
     const anime = (show.genres || []).some(g => g.id === 16) && (show.original_language === 'ja' || (show.origin_country || []).includes('JP'));
     if (!anime) return null;
+    const unsure = why => ({ unsure: why });
     const tmdbSeasons = (show.seasons || []).filter(x => x.season_number > 0 && x.episode_count > 0).sort((a, b) => a.season_number - b.season_number);
-    const meta = (await cachedJson(`https://v3-cinemeta.strem.io/meta/series/${imdbId}.json`, 12 * 3600 * 1000)).meta || {};
+    let meta;
+    try { meta = (await cachedJson(`https://v3-cinemeta.strem.io/meta/series/${imdbId}.json`, 12 * 3600 * 1000)).meta || {}; }
+    catch (e) { return season === 1 ? null : unsure(`IMDb episode list unavailable (${e.message})`); }
     const imdbCounts = new Map();
     for (const v of meta.videos || []) if (v.season > 0) imdbCounts.set(v.season, (imdbCounts.get(v.season) || 0) + 1);
-    if (!imdbCounts.size || !tmdbSeasons.length) return null;
-    // same split up to the season asked for: nothing to translate
+    if (!imdbCounts.size || !tmdbSeasons.length) return season === 1 ? null : unsure('no episode list for this show');
+    const lastImdb = Math.max(...imdbCounts.keys());
+    // position of the episode in the whole series
+    let absolute;
+    if (season <= lastImdb && episode <= (imdbCounts.get(season) || 0)) {
+        absolute = episode;
+        for (let s = 1; s < season; s++) absolute += imdbCounts.get(s) || 0;
+    } else if (season === 1) {
+        absolute = episode;                                               // asked by position already ("1:400")
+    } else if (season >= lastImdb && season <= lastImdb + 1) {
+        // the newest season, with episodes IMDb doesn't list yet (still airing): count on from the known ones
+        absolute = episode;
+        for (let s = 1; s < season; s++) absolute += imdbCounts.get(s) || 0;
+    } else return unsure(`IMDb has no S${season}E${episode}`);
     let same = true;
-    for (let s = 1; s <= season; s++) if ((imdbCounts.get(s) || 0) !== ((tmdbSeasons.find(x => x.season_number === s) || {}).episode_count || 0)) same = false;
-    if (same) return null;
-    if (episode > (imdbCounts.get(season) || 0)) return null;     // not an episode IMDb knows: leave it as asked
-    let absolute = episode;
-    for (let s = 1; s < season; s++) absolute += imdbCounts.get(s) || 0;
-    let rest = absolute, tmdbSeason = null, tmdbEpisode = null;
-    for (const x of tmdbSeasons) { if (rest <= x.episode_count) { tmdbSeason = x.season_number; tmdbEpisode = rest; break; } rest -= x.episode_count; }
-    if (!tmdbSeason) { const last = tmdbSeasons[tmdbSeasons.length - 1]; tmdbSeason = last.season_number; tmdbEpisode = rest + last.episode_count; }
+    for (let s = 1; s <= Math.min(season, lastImdb); s++) if ((imdbCounts.get(s) || 0) !== ((tmdbSeasons.find(x => x.season_number === s) || {}).episode_count || 0)) same = false;
+    if (season === 1 && absolute === episode && episode <= (imdbCounts.get(1) || 0) && same) return null;   // nothing to translate
+    let tmdbSeason = null, tmdbEpisode = null;
+    if (same && season > 1) { tmdbSeason = season; tmdbEpisode = episode; }
+    else {
+        let rest = absolute;
+        for (const x of tmdbSeasons) { if (rest <= x.episode_count) { tmdbSeason = x.season_number; tmdbEpisode = rest; break; } rest -= x.episode_count; }
+        if (!tmdbSeason) { const last = tmdbSeasons[tmdbSeasons.length - 1]; tmdbSeason = last.season_number; tmdbEpisode = rest + last.episode_count; }
+    }
     return { absolute, tmdbSeason, tmdbEpisode };
 }
+// what each site is asked for: pid -> [season, episode], or null = don't ask this site for this request
+async function numberingPlan(id, pType, tmdbId, season, episode) {
+    const imdb = String(id).split(':')[0];
+    if (pType !== 'tv' || !/^tt\d+$/.test(imdb)) return { remap: null, for: () => [season, episode] };
+    let remap;
+    try { remap = await animeNumbering(imdb, tmdbId, season, episode); }
+    catch (e) { remap = season > 1 ? { unsure: `numbering lookup failed (${e.message})` } : null; }
+    if (!remap) return { remap: null, for: () => [season, episode] };
+    if (remap.unsure) return { remap, for: () => null };
+    return { remap, for: pid => ABSOLUTE_SITES.includes(pid) ? [1, remap.absolute] : [remap.tmdbSeason, remap.tmdbEpisode] };
+}
+const unsureLookups = new Set();   // "type:id" answered without asking the sites: keep that answer only briefly
 
 async function showMeta(pType, tmdbId) {
     const k = `${pType}:${tmdbId}`;
@@ -445,17 +479,19 @@ async function lookup(type, id) {
     ctx.season = pType === 'tv' ? season : null; ctx.episode = episode;
     ctx.meta = await showMeta(pType, tmdbId);
 
-    const active = providers.filter(p => p.types.includes(pType));
+    const allActive = providers.filter(p => p.types.includes(pType));
     // anime asked for with IMDb's season split (e.g. One Piece season 2 = episodes 9-30): translate to the sites' own
     // numbering, otherwise they return a different episode
-    const remap = pType === 'tv' && /^tt\d+$/.test(String(id).split(':')[0]) ? await animeNumbering(String(id).split(':')[0], tmdbId, season, episode).catch(e => { log(`  numbering: ${e.message}`); return null; }) : null;
-    const numberingFor = pid => !remap ? [season, episode] : ABSOLUTE_SITES.includes(pid) ? [1, remap.absolute] : [remap.tmdbSeason, remap.tmdbEpisode];
-    if (remap) log(`  anime numbering: IMDb S${season}E${episode} = episode ${remap.absolute} = TMDB S${remap.tmdbSeason}E${remap.tmdbEpisode}`);
+    const plan = await numberingPlan(id, pType, tmdbId, season, episode);
+    const remap = plan.remap;
+    if (remap && remap.unsure) { log(`  anime numbering unsure: ${remap.unsure}; no site asked for this episode`); unsureLookups.add(`${type}:${id}`); }
+    else if (remap) log(`  anime numbering: IMDb S${season}E${episode} = episode ${remap.absolute} = TMDB S${remap.tmdbSeason}E${remap.tmdbEpisode}`);
+    const active = allActive.filter(p => plan.for(p.id));
     const results = [];
     const started = Date.now();
     const stoAccess = require('./sto-access.js');
     const goodKey = `${pType}:${tmdbId}:${season}:${episode}`;
-    const runs = active.map((p, order) => runProvider(p, tmdbId, pType, ...numberingFor(p.id))
+    const runs = active.map((p, order) => runProvider(p, tmdbId, pType, ...plan.for(p.id))
         .then(list => {
             // SerienStream: keep its last working answer; while s.to can't be asked, that answer stands in
             if (p.id === 'serienstream' && pType === 'tv') {
@@ -525,6 +561,8 @@ function videoKey(st) {
     const u = (job && job.u) || st.url || '';
     try { const x = new URL(u); return x.host + x.pathname; } catch (e) { return u.split('?')[0]; }
 }
+// the last stream requests (what the player asked for: type and id with season:episode), for checking numbering
+const recentRequests = [];
 // stream -> its health key (title | site | hoster)
 const srcKey = new WeakMap();
 const health = require('./health.js');
@@ -696,6 +734,8 @@ function getStreams(type, id, prefetched) {
         entry.ttl = (streams.length ? (prefetched ? PREFETCH_MIN : CACHE_MIN) : 2) * 60000;
         // s.to showed its check during this lookup: SerienStream's links are missing, so look again in 30 minutes
         if (type === 'series' && net.stoGated()) entry.ttl = Math.min(entry.ttl, 30 * 60000);
+        // the episode couldn't be placed for sure, nothing was asked: try again soon
+        if (unsureLookups.delete(key)) entry.ttl = Math.min(entry.ttl, 2 * 60000);
         verifyLater(key, entry, streams);
         return streams;
     }, err => { cache.delete(key); throw err; });
@@ -713,13 +753,19 @@ async function runDebugJob(job, only) {
     const tmdbId = /^tt\d+$/.test(ref) ? await toTmdb(ref, pType) : ref;
     job.tmdbId = tmdbId;
     if (!tmdbId) { job.done = true; job.error = 'no TMDB match'; return; }
+    // same numbering as a real stream request
+    const s0 = s ? Number(s) : null, e0 = e ? Number(e) : null;
+    const plan = await numberingPlan(ref, pType, tmdbId, s0, e0);
+    if (plan.remap) job.numbering = plan.remap;
     const list = providers.filter(p => p.types.includes(pType) && (!only || only.includes(p.id)));
     await Promise.all(list.map(async p => {
-        const entry = job.providers[p.id] = { running: true, requests: [] };
+        const asked = plan.for(p.id);
+        const entry = job.providers[p.id] = { running: true, requests: [], asked: asked ? (asked[0] != null ? `S${asked[0]}E${asked[1]}` : 'film') : 'not asked (episode not certain)' };
+        if (!asked) { entry.running = false; entry.streams = 0; return; }
         const t = Date.now();
         await net.traceStore.run(entry.requests, async () => {
             try {
-                const streams = (await runProvider(p, tmdbId, pType, s ? Number(s) : null, e ? Number(e) : null)) || [];
+                const streams = (await runProvider(p, tmdbId, pType, ...asked)) || [];
                 entry.streams = streams.length;
                 entry.sample = streams.slice(0, 3).map(x => `${x.name} | ${(x.url || '').slice(0, 70)}`);
             } catch (err) { entry.error = err.message; }
@@ -803,7 +849,7 @@ async function runAudit(audit) {
             const t0 = Date.now();
             let list = [];
             await net.traceStore.run(reqs, async () => {
-                try { list = (await runProvider(p, tmdbId, pType, s ? Number(s) : null, e ? Number(e) : null)) || []; }
+                try { list = (await runProvider(p, tmdbId, pType, ...asked)) || []; }
                 catch (err) { reqs.push({ log: 'ERROR ' + err.message }); }
             });
             const blockedHosts = [...new Set(reqs.filter(r => r.blocked).map(r => { try { return new URL(r.url).host; } catch (x) { return '?'; } }))];
@@ -830,7 +876,7 @@ async function runAudit(audit) {
 function addonManifest() {
     return {
         id: 'community.german-providers.addon',
-        version: '1.20.0',
+        version: '1.21.0',
         name: 'German Providers',
         description: `Deutsche Quellen (s.to, AniWorld, ARD, Arte, FilmPalast …) als Addon. Plugins v${pluginVersion} von InvalidPandaa/nuvio-german-providers (GPL-3.0).`,
         logo: publicBase ? `${publicBase}/logo.png` : 'https://flagcdn.com/w160/de.png',
@@ -924,7 +970,7 @@ const server = http.createServer(async (req, res) => {
     if ((req.url || '').startsWith('/p/')) return passthrough.handle(req, res, publicBase || `http://${req.headers.host}`);
     const url = decodeURIComponent((req.url || '/').split('?')[0]);
     if (req.method === 'OPTIONS') return send(res, 204, {});
-    if (url === '/streams/health') return send(res, 200, Object.assign(health.summary(), { relayBackoff: passthrough.usage().backoff }));
+    if (url === '/streams/health') return send(res, 200, Object.assign(health.summary(), { relayBackoff: passthrough.usage().backoff, recentRequests }));
     if (url === '/sto/status') { net.stoInit(); return send(res, 200, net.stoStatus()); }
     if (url === '/' || url === '/health') {
         // a real check: cron-job.org's "notify on failure" emails when this is not 200
@@ -1116,7 +1162,7 @@ ${ok && !enc ? '<p>Saved until the next server update (this machine could not cr
             const report = await Promise.all(providers.filter(p => p.types.includes(pType)).map(async p => {
                 const t = Date.now();
                 try {
-                    const list = await runProvider(p, tmdbId, pType, s ? Number(s) : null, e ? Number(e) : null);
+                    const list = await runProvider(p, tmdbId, pType, ...asked);
                     return { provider: p.id, streams: (list || []).length, ms: Date.now() - t, first: (list || [])[0] && list[0].name };
                 } catch (err) { return { provider: p.id, error: err.message, ms: Date.now() - t }; }
             }));
@@ -1131,6 +1177,7 @@ ${ok && !enc ? '<p>Saved until the next server update (this machine could not cr
     log(`stream ${m[1]} ${m[2]}`);
     try {
         // order: working first, failing (or on a video server we're pausing right now) last, hidden left out
+        recentRequests.unshift(`${new Date().toISOString().slice(11, 19)} ${m[1]} ${m[2]}`); recentRequests.length = Math.min(recentRequests.length, 30);
         const streams = health.apply(await getStreams(m[1], m[2]), st => srcKey.get(st), st => passthrough.paused(st.url));
         // autoplay asks for the next episode only seconds before it starts; have the answer ready by then
         const ep = m[1] !== 'movie' && m[2].match(/^(.*):(\d+):(\d+)$/);
