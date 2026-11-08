@@ -207,9 +207,30 @@ async function toTmdb(imdbId, type) {
     const d = await res.json();
     const hit = (type === 'movie' ? d.movie_results : d.tv_results)[0]
         || (d.tv_episode_results || [])[0] && { id: d.tv_episode_results[0].show_id };
-    const id = hit ? String(hit.id) : null;
+    let id = hit ? String(hit.id) : null;
+    // TMDB doesn't know this IMDb id (e.g. Dragon Ball Z's tt0214341): find the title by its name and year instead,
+    // using the public Stremio catalogue that gave the player this id (exact name; see the year rule below).
+    if (!id) id = await byNameAndYear(imdbId, type).catch(e => { log(`  ${imdbId}: name lookup failed: ${e.message}`); return null; });
     if (id) tmdbIds.set(key, id);
     return id;
+}
+const normTitle = s => String(s || '').toLowerCase().normalize('NFD').replace(/[\u0300-\u036f]/g, '').replace(/&/g, ' and ').replace(/[^a-z0-9]+/g, ' ').trim();
+async function byNameAndYear(imdbId, type) {
+    const r = await fetch(`https://v3-cinemeta.strem.io/meta/${type === 'movie' ? 'movie' : 'series'}/${imdbId}.json`, { signal: AbortSignal.timeout(10000) });
+    if (!r.ok) return null;
+    const meta = (await r.json()).meta || {};
+    const year = Number(String(meta.releaseInfo || meta.year || '').slice(0, 4));
+    if (!meta.name || !year) return null;
+    const kind = type === 'movie' ? 'movie' : 'tv';
+    const d = await (await fetch(`https://api.themoviedb.org/3/search/${kind}?api_key=${TMDB_API_KEY}&query=${encodeURIComponent(meta.name)}`)).json();
+    // same name; the same year (±1), or, if it is the only title with that exact name, a year within 8 (dubbed
+    // versions often list the year they aired abroad: Dragon Ball Z 1989 in Japan, 1996 on IMDb)
+    const same = (d.results || []).filter(x => [x.title, x.name, x.original_title, x.original_name].map(normTitle).includes(normTitle(meta.name)));
+    const yearOf = x => Number(String(x.release_date || x.first_air_date || '').slice(0, 4));
+    const hit = same.find(x => yearOf(x) && Math.abs(yearOf(x) - year) <= 1)
+        || (same.length === 1 && yearOf(same[0]) && Math.abs(yearOf(same[0]) - year) <= 8 ? same[0] : null);
+    if (hit) log(`  ${imdbId}: not linked on TMDB, matched "${meta.name}" (${year}) by name -> tmdb ${hit.id}`);
+    return hit ? String(hit.id) : null;
 }
 
 // ---------- turning plugin streams into addon streams ----------
@@ -230,6 +251,50 @@ function hostLabel(text) {
 }
 const pad2 = n => String(n).padStart(2, '0');
 const metaCache = new Map();   // "tv:123" -> { title, year }
+// ---------- anime episode numbering ----------
+// Catalogues like Xperience ask for anime with IMDb ids and IMDb's season split. IMDb splits long anime differently
+// from TMDB and from the German sites (One Piece: IMDb season 1 = 8 episodes, AniWorld/TMDB season 1 = 61). The
+// position of the episode in the whole series is the same everywhere, so: count it from IMDb's episode list (the
+// public Stremio catalogue), then
+//   - AniWorld and SerienStream get "season 1, episode <position>": their plugins walk on through the site's own
+//     seasons when season 1 has fewer episodes (as the sites number them)
+//   - every other site gets TMDB's season and episode (Huhu and others look episodes up by TMDB numbering)
+// Only for Japanese animation, and only when IMDb's season sizes differ from TMDB's; everything else is unchanged.
+const ABSOLUTE_SITES = ['aniworld', 'serienstream'];
+const numberingCache = new Map();
+async function cachedJson(url, ttl) {
+    const hit = numberingCache.get(url);
+    if (hit && Date.now() - hit.t < ttl) return hit.v;
+    const r = await fetch(url, { signal: AbortSignal.timeout(10000) });
+    if (!r.ok) throw new Error(`HTTP ${r.status} ${url.replace(/api_key=[^&]+/, 'api_key=***').slice(0, 80)}`);
+    const v = await r.json();
+    numberingCache.set(url, { t: Date.now(), v });
+    if (numberingCache.size > 500) numberingCache.delete(numberingCache.keys().next().value);
+    return v;
+}
+async function animeNumbering(imdbId, tmdbId, season, episode) {
+    if (!season || !episode) return null;
+    const show = await cachedJson(`https://api.themoviedb.org/3/tv/${tmdbId}?api_key=${TMDB_API_KEY}`, 12 * 3600 * 1000);
+    const anime = (show.genres || []).some(g => g.id === 16) && (show.original_language === 'ja' || (show.origin_country || []).includes('JP'));
+    if (!anime) return null;
+    const tmdbSeasons = (show.seasons || []).filter(x => x.season_number > 0 && x.episode_count > 0).sort((a, b) => a.season_number - b.season_number);
+    const meta = (await cachedJson(`https://v3-cinemeta.strem.io/meta/series/${imdbId}.json`, 12 * 3600 * 1000)).meta || {};
+    const imdbCounts = new Map();
+    for (const v of meta.videos || []) if (v.season > 0) imdbCounts.set(v.season, (imdbCounts.get(v.season) || 0) + 1);
+    if (!imdbCounts.size || !tmdbSeasons.length) return null;
+    // same split up to the season asked for: nothing to translate
+    let same = true;
+    for (let s = 1; s <= season; s++) if ((imdbCounts.get(s) || 0) !== ((tmdbSeasons.find(x => x.season_number === s) || {}).episode_count || 0)) same = false;
+    if (same) return null;
+    if (episode > (imdbCounts.get(season) || 0)) return null;     // not an episode IMDb knows: leave it as asked
+    let absolute = episode;
+    for (let s = 1; s < season; s++) absolute += imdbCounts.get(s) || 0;
+    let rest = absolute, tmdbSeason = null, tmdbEpisode = null;
+    for (const x of tmdbSeasons) { if (rest <= x.episode_count) { tmdbSeason = x.season_number; tmdbEpisode = rest; break; } rest -= x.episode_count; }
+    if (!tmdbSeason) { const last = tmdbSeasons[tmdbSeasons.length - 1]; tmdbSeason = last.season_number; tmdbEpisode = rest + last.episode_count; }
+    return { absolute, tmdbSeason, tmdbEpisode };
+}
+
 async function showMeta(pType, tmdbId) {
     const k = `${pType}:${tmdbId}`;
     if (metaCache.has(k)) return metaCache.get(k);
@@ -381,11 +446,16 @@ async function lookup(type, id) {
     ctx.meta = await showMeta(pType, tmdbId);
 
     const active = providers.filter(p => p.types.includes(pType));
+    // anime asked for with IMDb's season split (e.g. One Piece season 2 = episodes 9-30): translate to the sites' own
+    // numbering, otherwise they return a different episode
+    const remap = pType === 'tv' && /^tt\d+$/.test(String(id).split(':')[0]) ? await animeNumbering(String(id).split(':')[0], tmdbId, season, episode).catch(e => { log(`  numbering: ${e.message}`); return null; }) : null;
+    const numberingFor = pid => !remap ? [season, episode] : ABSOLUTE_SITES.includes(pid) ? [1, remap.absolute] : [remap.tmdbSeason, remap.tmdbEpisode];
+    if (remap) log(`  anime numbering: IMDb S${season}E${episode} = episode ${remap.absolute} = TMDB S${remap.tmdbSeason}E${remap.tmdbEpisode}`);
     const results = [];
     const started = Date.now();
     const stoAccess = require('./sto-access.js');
     const goodKey = `${pType}:${tmdbId}:${season}:${episode}`;
-    const runs = active.map((p, order) => runProvider(p, tmdbId, pType, season, episode)
+    const runs = active.map((p, order) => runProvider(p, tmdbId, pType, ...numberingFor(p.id))
         .then(list => {
             // SerienStream: keep its last working answer; while s.to can't be asked, that answer stands in
             if (p.id === 'serienstream' && pType === 'tv') {
@@ -760,7 +830,7 @@ async function runAudit(audit) {
 function addonManifest() {
     return {
         id: 'community.german-providers.addon',
-        version: '1.19.1',
+        version: '1.20.0',
         name: 'German Providers',
         description: `Deutsche Quellen (s.to, AniWorld, ARD, Arte, FilmPalast …) als Addon. Plugins v${pluginVersion} von InvalidPandaa/nuvio-german-providers (GPL-3.0).`,
         logo: publicBase ? `${publicBase}/logo.png` : 'https://flagcdn.com/w160/de.png',
