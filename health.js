@@ -83,9 +83,8 @@ const state = key => {
 
 // order a ready list for the player: working first, unknown next, failing last; hidden ones left out unless nothing
 // else would be left. keyOf(stream) gives a stream's key.
-function apply(list, keyOf) {
-    const rank = { ok: 0, unknown: 1, failing: 2, hidden: 3 };
-    const tagged = list.map((s, i) => ({ s, i, st: state(keyOf(s)) }));
+function apply(list, keyOf, paused) {
+    const tagged = list.map((s, i) => { let st = state(keyOf(s)); if (st !== 'hidden' && paused && paused(s)) st = 'failing'; return { s, i, st }; });
     const visible = tagged.filter(t => t.st !== 'hidden');
     const use = visible.length ? visible : tagged;
     // keep the existing order (language, quality, site preference) and only move failing ones behind the rest

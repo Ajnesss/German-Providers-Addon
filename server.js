@@ -582,13 +582,19 @@ function verifyLater(key, entry, streams) {
         // new evidence about the link itself
         const limited = outcomes.map(o => /^FAIL (429|503|504)\b/.test(o));
         verifyStats.checked += results.length;
-        const dead = new Set(check.filter((st, i) => !results[i] && !limited[i]));
+        const broken = check.filter((st, i) => !results[i] && !limited[i]);
+        const counted = check.filter((st, i) => !limited[i]).length;
+        // links that didn't start for any reason go to the end of the list; only real failures count for hiding
+        const dead = new Set(check.filter((st, i) => !results[i]));
         verifyStats.failed += dead.size;
-        // all failed: probably us (network), not them: record nothing
-        if (dead.size && dead.size === check.filter((st, i) => !limited[i]).length) return;
-        const byKey = new Map();
-        check.forEach((st, i) => { const k = srcKey.get(st); if (!k) return; if (limited[i]) { health.rateLimited(); return; } byKey.set(k, (byKey.get(k) || false) || results[i]); });
-        for (const [k, okNow] of byKey) okNow ? health.ok(k) : health.fail(k);
+        // every link failed: probably our own network, not the hosters: record nothing, change nothing
+        if (dead.size === check.length) return;
+        // every link that could be judged failed: same suspicion, so don't count it against them (still reorder)
+        if (!(broken.length && broken.length === counted)) {
+            const byKey = new Map();
+            check.forEach((st, i) => { const k = srcKey.get(st); if (!k) return; if (limited[i]) { health.rateLimited(); return; } byKey.set(k, (byKey.get(k) || false) || results[i]); });
+            for (const [k, okNow] of byKey) okNow ? health.ok(k) : health.fail(k);
+        }
         if (!dead.size) return;
         const ordered = streams.filter(st => !dead.has(st)).concat(streams.filter(st => dead.has(st)));
         if (cache.get(key) === entry) entry.promise = Promise.resolve(ordered);
@@ -754,7 +760,7 @@ async function runAudit(audit) {
 function addonManifest() {
     return {
         id: 'community.german-providers.addon',
-        version: '1.19.0',
+        version: '1.19.1',
         name: 'German Providers',
         description: `Deutsche Quellen (s.to, AniWorld, ARD, Arte, FilmPalast …) als Addon. Plugins v${pluginVersion} von InvalidPandaa/nuvio-german-providers (GPL-3.0).`,
         logo: publicBase ? `${publicBase}/logo.png` : 'https://flagcdn.com/w160/de.png',
@@ -1054,7 +1060,8 @@ ${ok && !enc ? '<p>Saved until the next server update (this machine could not cr
     const t0 = Date.now();
     log(`stream ${m[1]} ${m[2]}`);
     try {
-        const streams = health.apply(await getStreams(m[1], m[2]), st => srcKey.get(st));
+        // order: working first, failing (or on a video server we're pausing right now) last, hidden left out
+        const streams = health.apply(await getStreams(m[1], m[2]), st => srcKey.get(st), st => passthrough.paused(st.url));
         // autoplay asks for the next episode only seconds before it starts; have the answer ready by then
         const ep = m[1] !== 'movie' && m[2].match(/^(.*):(\d+):(\d+)$/);
         if (PREFETCH && ep && streams.length) {

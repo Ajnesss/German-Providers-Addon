@@ -239,4 +239,10 @@ function markFresh(link) {
     return proxyUrl(base, job.u, job.h, job.r, job.s, job.re, true, !!job.fp);
 }
 
-module.exports = { jobOf, markFresh, setRefresher: fn => { refresher = fn; }, usage: () => Object.assign({}, usage, { capGB: CAP_BYTES / 1024 ** 3, usedMB: Math.round(usage.bytes / 1048576), backoff: Object.fromEntries([...backoff].filter(([, b]) => b.until > Date.now()).map(([h, b]) => [h, `${b.why} until ${new Date(b.until).toISOString().slice(11, 19)}`])), decisions }), wanted, proxyUrl, handle, rewritePlaylist, mode: MODE, hosts: HOSTS };
+// is this stream's video server paused right now (rate-limited or not answering)?
+function paused(url) {
+    const job = jobOf(url);
+    if (!job || !job.u) return false;
+    try { const b = backoff.get(new URL(job.u).host); return !!(b && b.until > Date.now()); } catch (e) { return false; }
+}
+module.exports = { paused, jobOf, markFresh, setRefresher: fn => { refresher = fn; }, usage: () => Object.assign({}, usage, { capGB: CAP_BYTES / 1024 ** 3, usedMB: Math.round(usage.bytes / 1048576), backoff: Object.fromEntries([...backoff].filter(([, b]) => b.until > Date.now()).map(([h, b]) => [h, `${b.why} until ${new Date(b.until).toISOString().slice(11, 19)}`])), decisions }), wanted, proxyUrl, handle, rewritePlaylist, mode: MODE, hosts: HOSTS };
