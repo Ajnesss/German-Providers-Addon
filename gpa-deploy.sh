@@ -6,6 +6,8 @@
 #     "gpa_state", so it survives updates
 #   - the old version is stopped gently (it saves its memory first)
 #   - if the new version doesn't answer within 90 seconds, the previous version is started again
+#   - watchdog: if the running addon stops answering for 3 checks in a row (about 6 minutes), it is restarted
+#     (Docker already restarts it after a crash; this also catches a hang)
 cd /opt/gpa || exit 1
 SELF=/usr/local/bin/gpa-deploy
 OLD=$(git rev-parse HEAD)
@@ -51,4 +53,30 @@ if [ "$OLD" != "$NEW" ] || [ "$1" = "force" ] || ! docker ps --format '{{.Names}
     run gpa:previous
   fi
   docker image prune -f >/dev/null
+fi
+
+# 2. watchdog (only when nothing was deployed in this run)
+STRIKES=/var/lib/gpa-watchdog
+if docker ps --format '{{.Names}}' | grep -qx addon; then
+  # video still flowing out of the container (someone is watching through the relay): then it isn't hung, just busy;
+  # never restart it in the middle of playback
+  TX=$(timeout 15 docker stats --no-stream --format '{{.NetIO}}' addon 2>/dev/null | awk -F'/' '{print $2}' | tr -d ' ' \
+       | awk '{v=$0; u=v; gsub(/[0-9.]/,"",u); gsub(/[A-Za-z]/,"",v); m=1; if(u=="kB")m=1e3; else if(u=="MB")m=1e6; else if(u=="GB")m=1e9; else if(u=="TB")m=1e12; printf "%.0f", v*m}')
+  LAST_TX=$(cat /var/lib/gpa-watchdog-tx 2>/dev/null || echo 0)
+  [ -n "$TX" ] && echo "$TX" > /var/lib/gpa-watchdog-tx
+  BUSY=0
+  [ -n "$TX" ] && [ "$LAST_TX" -gt 0 ] && [ "$TX" -gt $(( LAST_TX + 20000000 )) ] 2>/dev/null && BUSY=1
+  if curl -fsS -m 10 http://127.0.0.1:8000/manifest.json >/dev/null 2>&1; then
+    rm -f "$STRIKES"
+  elif [ "$BUSY" = 1 ]; then
+    echo "$(date) addon slow to answer but still sending video: not restarting"
+  else
+    n=$(( $(cat "$STRIKES" 2>/dev/null || echo 0) + 1 ))
+    echo "$n" > "$STRIKES"
+    echo "$(date) addon not answering ($n/3)"
+    if [ "$n" -ge 3 ]; then
+      echo "$(date) restarting the addon"
+      docker restart -t 20 addon >/dev/null && rm -f "$STRIKES"
+    fi
+  fi
 fi

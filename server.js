@@ -392,7 +392,12 @@ async function lookup(type, id) {
                 if (list && list.length) stoAccess.rememberGood(goodKey, list);
                 else if (net.stoGated()) { const prev = stoAccess.standIn(goodKey); if (prev) { list = prev; log(`  serienstream: s.to paused, using its last working answer for this episode`); } stoMissed.add(`${type}:${id}`); }
             }
-            (list || []).filter(st => st && (st.ytId || st.externalUrl || /^https?:\/\//i.test(st.url || ''))).forEach((st, i) => results.push(Object.assign(toAddonStream(st, p, ctx), { order, i, pref: prefIndex(p.id), provider: p.id })));   // a host's error word ("RELOAD") is no link
+            (list || []).filter(st => st && (st.ytId || st.externalUrl || /^https?:\/\//i.test(st.url || ''))).forEach((st, i) => {
+                const item = Object.assign(toAddonStream(st, p, ctx), { order, i, pref: prefIndex(p.id), provider: p.id });
+                // health is remembered per title + site + hoster (links themselves change with every lookup)
+                srcKey.set(item.stream, `${type}:${id}|${p.id}|${String((st.name || '').split(' · ')[2] || st.ytId && 'youtube' || '').toLowerCase()}`);
+                results.push(item);
+            });   // a host's error word ("RELOAD") is no link
             log(`  ${p.id}: ${(list || []).length} streams in ${Date.now() - started} ms`);
         })
         .catch(err => log(`  ${p.id}: error ${err.message}`)));
@@ -450,6 +455,9 @@ function videoKey(st) {
     const u = (job && job.u) || st.url || '';
     try { const x = new URL(u); return x.host + x.pathname; } catch (e) { return u.split('?')[0]; }
 }
+// stream -> its health key (title | site | hoster)
+const srcKey = new WeakMap();
+const health = require('./health.js');
 const sortStreams = list => {
     const sorted = list.slice().sort((a, b) => demoted(a) - demoted(b) || a.rank - b.rank || (b.q || 0) - (a.q || 0) || a.pref - b.pref || a.order - b.order || a.i - b.i);
     const seen = new Set(), perHost = new Map(), out = [];
@@ -562,14 +570,26 @@ const verifyStats = { checked: 0, failed: 0 };
 function verifyLater(key, entry, streams) {
     if (!VERIFY || streams.length < 2) return;
     setTimeout(async () => {
-        const results = await Promise.all(streams.slice(0, VERIFY_MAX).map(async st => {
+        // the first links, plus a few hidden ones further down: that is how a recovered hoster comes back
+        const hiddenLater = streams.slice(VERIFY_MAX).filter(st => health.state(srcKey.get(st)) === 'hidden').slice(0, 3);
+        const check = streams.slice(0, VERIFY_MAX).concat(hiddenLater);
+        const outcomes = await Promise.all(check.map(async st => {
             await verifySlot();
-            try { return st.ytId || st.externalUrl ? true : /^OK/.test(await playCheck(st)); } catch (e) { return false; } finally { verifyDone(); }
+            try { return st.ytId || st.externalUrl ? 'OK' : await playCheck(st); } catch (e) { return 'FAIL ' + e.message; } finally { verifyDone(); }
         }));
+        const results = outcomes.map(o => /^OK/.test(o));
+        // rate-limited (429), or our own short pause for a server that was rate-limiting or not answering (503/504): no
+        // new evidence about the link itself
+        const limited = outcomes.map(o => /^FAIL (429|503|504)\b/.test(o));
         verifyStats.checked += results.length;
-        const dead = new Set(streams.slice(0, VERIFY_MAX).filter((st, i) => !results[i]));
+        const dead = new Set(check.filter((st, i) => !results[i] && !limited[i]));
         verifyStats.failed += dead.size;
-        if (!dead.size || dead.size === Math.min(streams.length, VERIFY_MAX)) return;   // all failed: probably us, not them
+        // all failed: probably us (network), not them: record nothing
+        if (dead.size && dead.size === check.filter((st, i) => !limited[i]).length) return;
+        const byKey = new Map();
+        check.forEach((st, i) => { const k = srcKey.get(st); if (!k) return; if (limited[i]) { health.rateLimited(); return; } byKey.set(k, (byKey.get(k) || false) || results[i]); });
+        for (const [k, okNow] of byKey) okNow ? health.ok(k) : health.fail(k);
+        if (!dead.size) return;
         const ordered = streams.filter(st => !dead.has(st)).concat(streams.filter(st => dead.has(st)));
         if (cache.get(key) === entry) entry.promise = Promise.resolve(ordered);
         log(`  checked ${key}: ${dead.size} of ${results.length} links don't start, moved to the end`);
@@ -734,7 +754,7 @@ async function runAudit(audit) {
 function addonManifest() {
     return {
         id: 'community.german-providers.addon',
-        version: '1.18.1',
+        version: '1.19.0',
         name: 'German Providers',
         description: `Deutsche Quellen (s.to, AniWorld, ARD, Arte, FilmPalast …) als Addon. Plugins v${pluginVersion} von InvalidPandaa/nuvio-german-providers (GPL-3.0).`,
         logo: publicBase ? `${publicBase}/logo.png` : 'https://flagcdn.com/w160/de.png',
@@ -828,6 +848,7 @@ const server = http.createServer(async (req, res) => {
     if ((req.url || '').startsWith('/p/')) return passthrough.handle(req, res, publicBase || `http://${req.headers.host}`);
     const url = decodeURIComponent((req.url || '/').split('?')[0]);
     if (req.method === 'OPTIONS') return send(res, 204, {});
+    if (url === '/streams/health') return send(res, 200, Object.assign(health.summary(), { relayBackoff: passthrough.usage().backoff }));
     if (url === '/sto/status') { net.stoInit(); return send(res, 200, net.stoStatus()); }
     if (url === '/' || url === '/health') {
         // a real check: cron-job.org's "notify on failure" emails when this is not 200
@@ -1033,7 +1054,7 @@ ${ok && !enc ? '<p>Saved until the next server update (this machine could not cr
     const t0 = Date.now();
     log(`stream ${m[1]} ${m[2]}`);
     try {
-        const streams = await getStreams(m[1], m[2]);
+        const streams = health.apply(await getStreams(m[1], m[2]), st => srcKey.get(st));
         // autoplay asks for the next episode only seconds before it starts; have the answer ready by then
         const ep = m[1] !== 'movie' && m[2].match(/^(.*):(\d+):(\d+)$/);
         if (PREFETCH && ep && streams.length) {
@@ -1079,6 +1100,7 @@ if (require.main === module) {
         log(`${sig}: saving state, stopping`);
         try { require('./sto-access.js')._save(); } catch (e) {}
         try { require('./notify.js').save(); } catch (e) {}
+        try { health.save(); } catch (e) {}
         server.close();
         setTimeout(() => process.exit(0), 1500).unref();
     });

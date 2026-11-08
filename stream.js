@@ -45,6 +45,8 @@ function ipFree(okRoutes, allRoutes) {
     return okRoutes.includes('node') && ok.size > 1 && ok.size === all.size;
 }
 const decisions = [];   // last decisions, for /net
+// video servers to leave alone for a while: host -> { why: '429' | 'timeout', wait, until }
+const backoff = new Map();
 function note(d) { decisions.unshift(Object.assign({ at: new Date().toISOString().slice(11, 19) }, d)); decisions.length = Math.min(decisions.length, 60); }
 
 const b64 = s => Buffer.from(s).toString('base64url');
@@ -152,6 +154,16 @@ async function handle(req, res, base) {
         let route = job.r;
         let playlist = /\.m3u8(\?|$)/i.test(job.u);
         let text = null, finalUrl = job.u;
+        const vhost = (() => { try { return new URL(job.u).host; } catch (e) { return ''; } })();
+        // a video server that is rate-limiting us (429) or not answering at all right now: say so at once instead of
+        // trying every connection again (that only makes the rate limit last longer)
+        if (!route) {
+            const b = backoff.get(vhost);
+            if (b && b.until > Date.now()) {
+                res.writeHead(b.why === '429' ? 503 : 504, { 'Retry-After': String(Math.ceil((b.until - Date.now()) / 1000)), 'Access-Control-Allow-Origin': '*' });
+                return res.end(b.why === '429' ? 'video server is rate-limiting, try again shortly' : 'video server not answering right now');
+            }
+        }
         if (!route) {
             // first request of a stream. Links can be single-use, so try one connection at a time, starting with the one
             // that opened the page this link came from, and keep the playlist we get instead of loading it twice.
@@ -166,9 +178,20 @@ async function handle(req, res, base) {
                 tried.push(`${rt}:${r.error ? 'error ' + r.error.slice(0, 40) : r.status + ' ' + (r.type || '').split(';')[0] + ' ' + (r.head || '').replace(/\s+/g, ' ').slice(0, 60)}`);
                 if (r.text && /^#EXTM3U/.test(r.text.trim()) && r.status < 400) { route = rt; info = r; break; }
                 if (!r.error && isMedia(r)) { route = rt; info = r; break; }
+                if (r.status === 429) break;                  // rate limit: other connections won't help, they make it worse
             }
             if (!route) {
                 note({ start: new URL(job.u).host, tried: tried.join(' | ') });
+                if (last && last.status === 429) {
+                    const prev = backoff.get(vhost);
+                    const wait = Math.min(15 * 60000, prev && prev.why === '429' ? prev.wait * 2 : 60000);
+                    backoff.set(vhost, { why: '429', wait, until: Date.now() + wait });
+                    res.writeHead(503, { 'Retry-After': String(wait / 1000), 'Access-Control-Allow-Origin': '*' });
+                    return res.end('video server is rate-limiting, try again shortly');
+                }
+                // every connection timed out: the video server is down or unreachable from here for now (5 minutes)
+                if (tried.length && tried.every(t => /error .*(abort|timeout|timed out)/i.test(t)))
+                    backoff.set(vhost, { why: 'timeout', wait: 5 * 60000, until: Date.now() + 5 * 60000 });
                 if (await tryRefresh(job, res)) return;
                 res.writeHead(502); return res.end('refused: ' + tried.join(' | '));
             }
@@ -216,4 +239,4 @@ function markFresh(link) {
     return proxyUrl(base, job.u, job.h, job.r, job.s, job.re, true, !!job.fp);
 }
 
-module.exports = { jobOf, markFresh, setRefresher: fn => { refresher = fn; }, usage: () => Object.assign({}, usage, { capGB: CAP_BYTES / 1024 ** 3, usedMB: Math.round(usage.bytes / 1048576), decisions }), wanted, proxyUrl, handle, rewritePlaylist, mode: MODE, hosts: HOSTS };
+module.exports = { jobOf, markFresh, setRefresher: fn => { refresher = fn; }, usage: () => Object.assign({}, usage, { capGB: CAP_BYTES / 1024 ** 3, usedMB: Math.round(usage.bytes / 1048576), backoff: Object.fromEntries([...backoff].filter(([, b]) => b.until > Date.now()).map(([h, b]) => [h, `${b.why} until ${new Date(b.until).toISOString().slice(11, 19)}`])), decisions }), wanted, proxyUrl, handle, rewritePlaylist, mode: MODE, hosts: HOSTS };
