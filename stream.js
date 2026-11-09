@@ -150,6 +150,8 @@ async function handle(req, res, base) {
     try { job = JSON.parse(unb64(m[2])); } catch (e) { res.writeHead(400); return res.end('bad link'); }
     const headers = Object.assign({}, job.h);
     if (!Object.keys(headers).some(k => k.toLowerCase() === 'user-agent')) headers['User-Agent'] = UA;
+    // Plex: the token of your linked account is added here, on the server, so it never appears in a link
+    try { if (new URL(job.u).host === 'vod.provider.plex.tv') Object.assign(headers, require('./plex.js').headers()); } catch (e) {}
     try {
         let route = job.r;
         let playlist = /\.m3u8(\?|$)/i.test(job.u);
