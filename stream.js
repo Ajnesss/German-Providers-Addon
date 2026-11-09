@@ -76,7 +76,25 @@ function proxyUrl(base, url, headers, route, source, re, fresh, force) {
 
 const isPlaylist = (url, type, head) => /mpegurl/i.test(type || '') || /\.m3u8(\?|$)/i.test(url) || /^#EXTM3U/.test(head || '');
 
+// Plex lists 6 qualities, 3 German audio versions and English subtitles; the player would read several playlists before
+// the first picture. Keep the best quality and one German audio track: fewer requests, a faster start.
+function simplifyPlexMaster(text) {
+    if (!/#EXT-X-STREAM-INF/.test(text)) return text;
+    const lines = text.split(/\r?\n/);
+    const audio = lines.filter(l => /^#EXT-X-MEDIA:.*TYPE=AUDIO/.test(l));
+    const german = audio.find(l => /LANGUAGE="(de|deu|ger)/i.test(l)) || audio[0];
+    let best = -1, bestBw = -1;
+    lines.forEach((l, i) => { const m = l.match(/^#EXT-X-STREAM-INF:.*?\bBANDWIDTH=(\d+)/); if (m && Number(m[1]) > bestBw && lines[i + 1]) { bestBw = Number(m[1]); best = i; } });
+    if (best < 0) return text;
+    const out = ['#EXTM3U'];
+    for (const l of lines) if (/^#EXT-X-(VERSION|INDEPENDENT-SEGMENTS)/.test(l)) out.push(l);
+    if (german) out.push(german.replace(/DEFAULT=(YES|NO)/, 'DEFAULT=YES').replace(/^(#EXT-X-MEDIA:)(?!.*DEFAULT=)/, '$1DEFAULT=YES,'));
+    out.push(lines[best].replace(/,?SUBTITLES="[^"]*"/, ''), lines[best + 1]);
+    return out.join('\n') + '\n';
+}
+
 async function rewritePlaylist(text, baseUrl, base, headers, route, force) {
+    try { if (new URL(baseUrl).host === 'vod.provider.plex.tv') text = simplifyPlexMaster(text); } catch (e) {}
     const abs = u => new URL(u, baseUrl).toString();
     const lines = text.split(/\r?\n/);
     const media = /#EXTINF/.test(text);     // a playlist of video pieces (not a list of qualities)
@@ -247,4 +265,4 @@ function paused(url) {
     if (!job || !job.u) return false;
     try { const b = backoff.get(new URL(job.u).host); return !!(b && b.until > Date.now()); } catch (e) { return false; }
 }
-module.exports = { paused, jobOf, markFresh, setRefresher: fn => { refresher = fn; }, usage: () => Object.assign({}, usage, { capGB: CAP_BYTES / 1024 ** 3, usedMB: Math.round(usage.bytes / 1048576), backoff: Object.fromEntries([...backoff].filter(([, b]) => b.until > Date.now()).map(([h, b]) => [h, `${b.why} until ${new Date(b.until).toISOString().slice(11, 19)}`])), decisions }), wanted, proxyUrl, handle, rewritePlaylist, mode: MODE, hosts: HOSTS };
+module.exports = { simplifyPlexMaster, paused, jobOf, markFresh, setRefresher: fn => { refresher = fn; }, usage: () => Object.assign({}, usage, { capGB: CAP_BYTES / 1024 ** 3, usedMB: Math.round(usage.bytes / 1048576), backoff: Object.fromEntries([...backoff].filter(([, b]) => b.until > Date.now()).map(([h, b]) => [h, `${b.why} until ${new Date(b.until).toISOString().slice(11, 19)}`])), decisions }), wanted, proxyUrl, handle, rewritePlaylist, mode: MODE, hosts: HOSTS };
