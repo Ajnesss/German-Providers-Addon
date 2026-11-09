@@ -195,6 +195,13 @@ async function smartFetch(input, opts = {}) {
             trace({ url, route, error: String(e.message || e).slice(0, 120), ms: Date.now() - t });
             count(host, route, 'error');
             lastErr = e;
+            // can't even connect from this server's own address (some hosts turn away cloud servers): the routes that
+            // leave from the same address (node, direct) won't do better, but WARP/the proxy leave from elsewhere
+            if (/connect|ETIMEDOUT|EHOSTUNREACH|ENETUNREACH/i.test(`${e && e.message || e} ${e && e.cause && (e.cause.code || e.cause.message) || ''}`) && (route === 'node' || route === 'direct') && order.some(r => r === 'warp' || r === 'proxy')) {
+                const rest = order.slice(order.indexOf(route) + 1).filter(r => r !== 'node' && r !== 'direct');
+                order.length = order.indexOf(route) + 1; order.push(...rest);
+                continue;
+            }
             // a slow site stays slow on every route: don't spend another 20 s per route on it
             if (isTimeout(e) && !sawBlock) { markDown(host, Date.now() - started); break; }
             // a broken certificate or a refused connection is the same on every route

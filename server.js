@@ -82,6 +82,12 @@ function loadPlugin(file) {
     // veev.to: no reader in the plugins (Moflix lists it for many episodes)
     if (process.env.VEEV !== '0' && /^var HOSTS = \[/m.test(code) && !code.includes('veev.to'))
         code = `var __veev = require(${JSON.stringify(path.join(__dirname, 'veev.js'))});\n` + code.replace(/^var HOSTS = \[/m, 'var HOSTS = [\n  [__veev.forPlugins, ["veev.to", "veev.pro", "poophq.com", "doods.to"]],');
+    // vids.st: Moflix lists it for many films (1080p MP4s with German audio); no reader in the plugins
+    if (process.env.VIDSST !== '0' && /^var HOSTS = \[/m.test(code) && !code.includes('vids.st'))
+        code = `var __vidsst = require(${JSON.stringify(path.join(__dirname, 'vidsst.js'))});\n` + code.replace(/^var HOSTS = \[/m, 'var HOSTS = [\n  [__vidsst.forPlugins, ["vids.st"]],');
+    // StreamOrigin (embedorigin.cc): Moflix lists it for films; a plain JSON player API, German audio checked in the playlist
+    if (process.env.STREAMORIGIN !== '0' && /^var HOSTS = \[/m.test(code) && !code.includes('embedorigin'))
+        code = `var __sorigin = require(${JSON.stringify(path.join(__dirname, 'streamorigin.js'))});\n` + code.replace(/^var HOSTS = \[/m, 'var HOSTS = [\n  [__sorigin.forPlugins, ["embedorigin.cc", "streamorigin.cc", "streamorigin.to"]],');
     // Filemoon moved to a new player ("Byse"); the plugins' old reader finds nothing there any more
     if (process.env.BYSE !== '0' && code.includes('[filemoon, ["filemoon"]]'))
         code = `var __byse = require(${JSON.stringify(path.join(__dirname, 'byse.js'))});\n` + code.replace('[filemoon, ["filemoon"]]', '[__byse.forPlugins, ["filemoon", "byse", "bysekoze"]]');
@@ -89,6 +95,10 @@ function loadPlugin(file) {
     if (process.env.HUHU_V2 !== '0' && code.includes('mediaurl-source.json') && /^function sources\(/m.test(code))
         code += require('./huhu-v2.js').PATCH;
     // AniWorld films: stricter matching (no film of another series because of a generic word)
+    // AniWorld/SerienStream: walking on through the site's seasons also checks whether the site splits its seasons
+    // like IMDb (then IMDb's season/episode is used directly)
+    if (process.env.NUMBERING_WALK !== '0' && /^function splitSeasonPath\(/m.test(code))
+        code += require('./numbering-walk.js').PATCH;
     if (process.env.AW_FILMS !== '0' && code.includes('var BASE = "https://aniworld.to"') && /^function findMovie\(/m.test(code))
         code += require('./aniworld-films.js').PATCH;
     // let the SerienStream hand-off use the plugins' host readers (VOE, Dood, Filemoon, ...)
@@ -185,9 +195,12 @@ function withLimit(promise, ms, what) {
 }
 // a site that fails 3 times in a row (errors / hangs) is paused for an hour, then tried again
 const PAUSE_AFTER = 3, PAUSE_MS = 60 * 60000;
-function runProvider(p, tmdbId, type, season, episode) {
+const numberingStore = new (require('async_hooks').AsyncLocalStorage)();
+globalThis.__gpaNumbering = numberingStore;
+function runProvider(p, tmdbId, type, season, episode, hint) {
     if (p.pausedUntil > Date.now()) return Promise.resolve([]);
-    const job = p.lock.then(() => withLimit(Promise.resolve().then(() => p.mod.getStreams(tmdbId, type, season, episode)), PROVIDER_LIMIT_MS, p.id));
+    const call = () => p.mod.getStreams(tmdbId, type, season, episode);
+    const job = p.lock.then(() => withLimit(Promise.resolve().then(() => hint ? numberingStore.run(hint, call) : call()), PROVIDER_LIMIT_MS, p.id));
     p.lock = job.catch(() => {});
     job.then(() => { p.fails = 0; }, err => {
         p.fails = (p.fails || 0) + 1;
@@ -314,7 +327,7 @@ async function animeNumbering(imdbId, tmdbId, season, episode) {
         for (const x of tmdbSeasons) { if (rest <= x.episode_count) { tmdbSeason = x.season_number; tmdbEpisode = rest; break; } rest -= x.episode_count; }
         if (!tmdbSeason) { const last = tmdbSeasons[tmdbSeasons.length - 1]; tmdbSeason = last.season_number; tmdbEpisode = rest + last.episode_count; }
     }
-    return { absolute, tmdbSeason, tmdbEpisode };
+    return { absolute, tmdbSeason, tmdbEpisode, imdbCounts: [...imdbCounts.entries()].sort((a, b) => a[0] - b[0]).map(x => x[1]) };
 }
 // what each site is asked for: pid -> [season, episode], or null = don't ask this site for this request
 async function numberingPlan(id, pType, tmdbId, season, episode) {
@@ -325,7 +338,10 @@ async function numberingPlan(id, pType, tmdbId, season, episode) {
     catch (e) { remap = season > 1 ? { unsure: `numbering lookup failed (${e.message})` } : null; }
     if (!remap) return { remap: null, for: () => [season, episode] };
     if (remap.unsure) return { remap, for: () => null };
-    return { remap, for: pid => ABSOLUTE_SITES.includes(pid) ? [1, remap.absolute] : [remap.tmdbSeason, remap.tmdbEpisode] };
+    // AniWorld/SerienStream also get IMDb's own season and episode as a hint: if the site splits its seasons like IMDb
+    // (only a stray episode or two different), its own season S, episode E is the right one (see numbering-walk.js)
+    const hint = { season, episode, imdbCounts: remap.imdbCounts };
+    return { remap, for: pid => ABSOLUTE_SITES.includes(pid) ? [1, remap.absolute, hint] : [remap.tmdbSeason, remap.tmdbEpisode] };
 }
 const unsureLookups = new Set();   // "type:id" answered without asking the sites: keep that answer only briefly
 
@@ -844,7 +860,9 @@ async function runAudit(audit) {
         const pType = t.type === 'movie' ? 'movie' : 'tv';
         const tmdbId = await toTmdb(ref, pType).catch(() => null);
         if (!tmdbId) { row.error = 'no TMDB match'; continue; }
-        await Promise.all(providers.filter(p => p.types.includes(pType)).map(async p => {
+        const plan = await numberingPlan(ref, pType, tmdbId, s ? Number(s) : null, e ? Number(e) : null);
+        await Promise.all(providers.filter(p => p.types.includes(pType) && plan.for(p.id)).map(async p => {
+            const asked = plan.for(p.id);
             const reqs = [];
             const t0 = Date.now();
             let list = [];
@@ -876,7 +894,7 @@ async function runAudit(audit) {
 function addonManifest() {
     return {
         id: 'community.german-providers.addon',
-        version: '1.21.1',
+        version: '1.22.0',
         name: 'German Providers',
         description: `Deutsche Quellen (s.to, AniWorld, ARD, Arte, FilmPalast …) als Addon. Plugins v${pluginVersion} von InvalidPandaa/nuvio-german-providers (GPL-3.0).`,
         logo: publicBase ? `${publicBase}/logo.png` : 'https://flagcdn.com/w160/de.png',
@@ -1159,7 +1177,9 @@ ${ok && !enc ? '<p>Saved until the next server update (this machine could not cr
             const [ref, s, e] = c[2].split(':');
             const pType = c[1] === 'movie' ? 'movie' : 'tv';
             const tmdbId = /^tt\d+$/.test(ref) ? await toTmdb(ref, pType) : ref;
-            const report = await Promise.all(providers.filter(p => p.types.includes(pType)).map(async p => {
+            const plan = await numberingPlan(ref, pType, tmdbId, s ? Number(s) : null, e ? Number(e) : null);
+            const report = await Promise.all(providers.filter(p => p.types.includes(pType) && plan.for(p.id)).map(async p => {
+                const asked = plan.for(p.id);
                 const t = Date.now();
                 try {
                     const list = await runProvider(p, tmdbId, pType, ...asked);
