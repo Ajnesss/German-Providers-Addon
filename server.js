@@ -745,6 +745,7 @@ function getStreams(type, id, prefetched) {
     const key = `${type}:${id}`;
     const hit = cache.get(key);
     if (hit && Date.now() - hit.time < hit.ttl) return hit.promise;
+    const warpMissing = process.env.WARP !== '0' && !net.warpOn();   // WARP still starting (first minutes after a restart) or down
     const promise = lookup(type, id).then(streams => {
         // nothing found: only remember that briefly
         entry.ttl = (streams.length ? (prefetched ? PREFETCH_MIN : CACHE_MIN) : 2) * 60000;
@@ -752,6 +753,8 @@ function getStreams(type, id, prefetched) {
         if (type === 'series' && net.stoGated()) entry.ttl = Math.min(entry.ttl, 30 * 60000);
         // the episode couldn't be placed for sure, nothing was asked: try again soon
         if (unsureLookups.delete(key)) entry.ttl = Math.min(entry.ttl, 2 * 60000);
+        // looked up while WARP wasn't available: the sites and hosts that need it are missing, look again soon
+        if (warpMissing) entry.ttl = Math.min(entry.ttl, 10 * 60000);
         verifyLater(key, entry, streams);
         return streams;
     }, err => { cache.delete(key); throw err; });
@@ -894,7 +897,7 @@ async function runAudit(audit) {
 function addonManifest() {
     return {
         id: 'community.german-providers.addon',
-        version: '1.22.0',
+        version: '1.22.1',
         name: 'German Providers',
         description: `Deutsche Quellen (s.to, AniWorld, ARD, Arte, FilmPalast …) als Addon. Plugins v${pluginVersion} von InvalidPandaa/nuvio-german-providers (GPL-3.0).`,
         logo: publicBase ? `${publicBase}/logo.png` : 'https://flagcdn.com/w160/de.png',
