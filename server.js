@@ -897,7 +897,7 @@ async function runAudit(audit) {
 function addonManifest() {
     return {
         id: 'community.german-providers.addon',
-        version: '1.22.1',
+        version: '1.23.0',
         name: 'German Providers',
         description: `Deutsche Quellen (s.to, AniWorld, ARD, Arte, FilmPalast …) als Addon. Plugins v${pluginVersion} von InvalidPandaa/nuvio-german-providers (GPL-3.0).`,
         logo: publicBase ? `${publicBase}/logo.png` : 'https://flagcdn.com/w160/de.png',
@@ -1065,6 +1065,40 @@ const server = http.createServer(async (req, res) => {
 <p>Logged in: <b>${test.loggedIn ? 'yes' : 'no'}</b> · Check required: <b>${test.gate || '?'}</b> · German hoster link: <b>${test.hosterLink || 'none'}</b>${test.error ? ' · Error: ' + test.error : ''}</p>
 ${ok && enc ? `<p><b>Keep it after updates:</b> on GitHub choose <i>Add file → Create new file</i>, name it <code>sto-session.enc</code>, paste everything below and commit. It is encrypted so that only your Oracle server can read it.</p><textarea rows="6" readonly onclick="this.select()">${enc}</textarea>` : ''}
 ${ok && !enc ? '<p>Saved until the next server update (this machine could not create an encrypted copy).</p>' : ''}`);
+    }
+    // Plex: link your account (Plex's own sign-in page), status, and read-only catalogue look-ups (see plex.js)
+    if (url.startsWith('/plex/')) {
+        const plex = require('./plex.js');
+        const page = (title, body) => { res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-store' }); res.end(`<!doctype html><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>${title}</title>
+<style>body{font:16px system-ui,sans-serif;max-width:640px;margin:32px auto;padding:0 16px;background:#14171c;color:#e8e8e8}input,button,a.b{display:block;width:100%;box-sizing:border-box;margin:6px 0 14px;padding:12px;border-radius:6px;border:1px solid #444;background:#1f242c;color:#fff;font:inherit;text-align:center;text-decoration:none}button,a.b{background:#e5a00d;color:#000;border:0;cursor:pointer;font-weight:600}small{color:#aaa}</style>${body}`); };
+        if (url === '/plex/status') return send(res, 200, plex.status());
+        if (url === '/plex/try') {
+            const q = new URL(req.url, 'http://x').searchParams;
+            try { return send(res, 200, await plex.tryGet(net.nativeFetch, q.get('url') || '')); } catch (e) { return send(res, 200, { error: e.message }); }
+        }
+        if (url === '/plex/finish') {
+            try { return send(res, 200, await plex.finishLink(net.nativeFetch)); } catch (e) { return send(res, 200, { error: e.message }); }
+        }
+        if (url === '/plex/link') {
+            if (req.method !== 'POST') {
+                const st = plex.status();
+                return page('Plex for the addon', `<h2>Plex for the addon</h2><p>Status: <b>${st.linked ? 'linked since ' + st.linkedAt : 'not linked'}</b></p>
+<form method="post"><label>Admin password</label><input name="token" type="password" autocomplete="off" required>
+<input type="hidden" name="do" value="${st.linked ? 'unlink' : 'link'}"><button>${st.linked ? 'Unlink Plex' : 'Link my Plex account'}</button></form>
+<small>Linking opens Plex's own sign-in page. You sign in there yourself; the addon only receives a token for your account, kept on your server.</small>`);
+            }
+            let body = '';
+            for await (const c of req) { body += c; if (body.length > 5000) break; }
+            const q = new URLSearchParams(body);
+            if (!adminOk(q)) return page('Plex', '<h2>Wrong admin password</h2>');
+            if (q.get('do') === 'unlink') { plex.unlink(); return page('Plex', '<h2>Plex unlinked</h2>'); }
+            try {
+                const link = await plex.startLink(net.nativeFetch);
+                return page('Link Plex', `<h2>Step 1: sign in at Plex</h2><a class="b" href="${link}" target="_blank" rel="noopener">Open Plex and allow "German Providers"</a>
+<h2>Step 2</h2><p id="s">Waiting for you to allow it on the Plex page…</p>
+<script>const s=document.getElementById('s');const t=setInterval(async()=>{try{const d=await (await fetch('/plex/finish')).json();if(d.linked){clearInterval(t);s.innerHTML='<b>✅ Plex is linked.</b> You can close this page.'}}catch(e){}},3000);setTimeout(()=>clearInterval(t),10*60000)</script>`);
+            } catch (e) { return page('Plex', `<h2>Plex did not answer</h2><p>${String(e.message).replace(/[<>&]/g, '')}</p>`); }
+        }
     }
     if (url === '/debug/fetch') {
         const q = new URL(req.url, 'http://x').searchParams;
