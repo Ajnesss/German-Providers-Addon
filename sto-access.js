@@ -119,19 +119,61 @@ function kindOf(u) {
 }
 
 // ---------- polite scheduling ----------
+// Besides 2 at a time and 400 ms apart, a ceiling on how much is sent in total, so a burst (a long browse, many
+// titles at once, catching up after a pause) can't pile up: at most STO_BUDGET_5MIN requests in any 5 minutes and
+// STO_BUDGET_HOUR in any hour. Background work (prefetch, catching up) only uses half of that, so there is always
+// room left for someone who is about to watch. A request that would have to wait longer than STO_BUDGET_WAIT_MS
+// for room isn't sent at all; the episode then comes from what the addon remembers, or from the other sites.
+const BUDGET_5MIN = Number(process.env.STO_BUDGET_5MIN) || 80;
+const BUDGET_HOUR = Number(process.env.STO_BUDGET_HOUR) || 300;
+const BUDGET_WAIT_MS = Number(process.env.STO_BUDGET_WAIT_MS) || 15000;
+const starts = [];   // when each request was sent (last hour)
 const queues = { high: [], low: [] };
-let lastStart = 0, pumpTimer = null;
+let lastStart = 0, pumpTimer = null, pumpDue = 0;
 function slot() {
-    return new Promise(resolve => { queues[priority.getStore() === 'low' ? 'low' : 'high'].push(resolve); pump(); });
+    return new Promise((resolve, reject) => {
+        const item = { resolve, reject, at: Date.now() };
+        queues[priority.getStore() === 'low' ? 'low' : 'high'].push(item); pump();
+    });
+}
+function used() {
+    const now = Date.now();
+    while (starts.length && starts[0] < now - HOUR) starts.shift();
+    let five = 0;
+    for (let i = starts.length - 1; i >= 0 && starts[i] >= now - 5 * MIN; i--) five++;
+    return { five, hour: starts.length };
+}
+// when (ms from now) the given share of the budget has room again; 0 = now
+function roomIn(share) {
+    const u = used(), now = Date.now();
+    const lim5 = Math.floor(BUDGET_5MIN * share), limH = Math.floor(BUDGET_HOUR * share);
+    let wait = 0;
+    if (u.five >= lim5) { const five = starts.filter(t => t >= now - 5 * MIN); wait = Math.max(wait, five[five.length - lim5] + 5 * MIN - now); }
+    if (u.hour >= limH) wait = Math.max(wait, starts[starts.length - limH] + HOUR - now);
+    return Math.max(0, wait);
 }
 function pump() {
+    // give up on requests that have waited too long for room (the player would have stopped waiting anyway)
+    for (const q of ['high', 'low']) while (queues[q].length && Date.now() - queues[q][0].at > (q === 'high' ? BUDGET_WAIT_MS : 10 * MIN)) {
+        st.budgetDropped = (st.budgetDropped || 0) + 1;
+        queues[q].shift().reject(new Error('s.to request limit reached, not sent'));
+    }
     while (st.active < CONCURRENCY && (queues.high.length || queues.low.length)) {
-        const wait = lastStart + SPACING_MS - Date.now();
-        if (wait > 0) { if (!pumpTimer) pumpTimer = setTimeout(() => { pumpTimer = null; pump(); }, wait); return; }
+        const q = queues.high.length ? 'high' : 'low';
+        const wait = Math.max(lastStart + SPACING_MS - Date.now(), roomIn(q === 'high' ? 1 : 0.5));
+        if (wait > 0) {
+            const due = Date.now() + Math.min(wait, queues.high.length ? 1000 : 5000);
+            if (pumpTimer && pumpDue <= due) return;
+            if (pumpTimer) clearTimeout(pumpTimer);
+            pumpDue = due;
+            pumpTimer = setTimeout(() => { pumpTimer = null; pump(); }, due - Date.now());
+            return;
+        }
         st.active++;
         st.peak = Math.max(st.peak, st.active);
         lastStart = Date.now();
-        (queues.high.shift() || queues.low.shift())();
+        starts.push(lastStart);
+        queues[q].shift().resolve();
     }
 }
 function release() { st.active--; pump(); }
@@ -405,6 +447,7 @@ function status() {
         lastCheckSeen: st.lastCheck ? new Date(st.lastCheck).toISOString() : null,
         availabilityPercent: { '24h': availability(24), '7d': availability(168) },
         sentToSto: { '5min': sentWithin(5), '60min': sentWithin(60), '24h': sentWithin(1440) },
+        requestLimit: { per5min: BUDGET_5MIN, perHour: BUDGET_HOUR, usedNow: used(), notSentBecauseOfLimit: st.budgetDropped || 0 },
         answeredWithoutAsking: st.served, remembered: { playLinks: links.size, pages: pages.size, episodes: lastGood.size },
         addresses: { inUse: DOMAINS[dom.active], list: dom.info.map(x => ({ address: x.origin, lastAnswered: x.lastOk ? new Date(x.lastOk).toISOString() : null, lastFailed: x.lastFail ? new Date(x.lastFail).toISOString() : null, lastError: x.lastError })) },
         recentEvents: events.slice(-15),
