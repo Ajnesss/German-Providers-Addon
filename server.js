@@ -38,7 +38,7 @@ function keyFromRepo() {
 const RELAY_TOKEN = (process.env.RELAY_TOKEN || '').trim();   // password for /relay/config and /setkey; also unlocks tmdb-key.enc
 // Admin pages (debug fetch, set key, relay config) take their own password. Only its SHA-256 fingerprint is stored
 // here, so the public repo never contains it. (RELAY_TOKEN above still unlocks tmdb-key.enc, nothing else.)
-const ADMIN_HASH = (process.env.ADMIN_HASH || '93bd5e64a618aaf5f397cd631cd61dc06021e956b16a317f0ec750c93eaf47fd').trim().toLowerCase();
+const ADMIN_HASH = (process.env.ADMIN_HASH || '14b12f6d3628e6cfb80d96fc6fae5184ecdcb61507ee832ba1b38d95ec795cfe').trim().toLowerCase();
 const adminOk = q => {
     const t = String((q && q.get('token')) || '');
     return !!t && require('crypto').createHash('sha256').update(t).digest('hex') === ADMIN_HASH;
@@ -897,7 +897,7 @@ async function runAudit(audit) {
 function addonManifest() {
     return {
         id: 'community.german-providers.addon',
-        version: '1.23.0',
+        version: '1.23.1',
         name: 'German Providers',
         description: `Deutsche Quellen (s.to, AniWorld, ARD, Arte, FilmPalast …) als Addon. Plugins v${pluginVersion} von InvalidPandaa/nuvio-german-providers (GPL-3.0).`,
         logo: publicBase ? `${publicBase}/logo.png` : 'https://flagcdn.com/w160/de.png',
