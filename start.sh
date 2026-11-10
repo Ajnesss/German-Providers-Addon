@@ -5,7 +5,10 @@
 # keep failing, a fresh WARP account is made.
 if [ "${WARP:-1}" != "0" ] && command -v wgcf >/dev/null 2>&1 && command -v wireproxy >/dev/null 2>&1; then
   (
-    mkdir -p /tmp/warp && cd /tmp/warp || exit 1
+    # the WARP account is kept with the addon's memory (Docker volume), so a restart or update reuses it instead of
+    # registering a new one every time: WARP is up within about half a minute after a deploy instead of minutes
+    WDIR="${STATE_DIR:-/tmp}/warp"
+    mkdir -p "$WDIR" && cd "$WDIR" || exit 1
     wait=20
     badstarts=0
     while true; do
@@ -15,13 +18,17 @@ if [ "${WARP:-1}" != "0" ] && command -v wgcf >/dev/null 2>&1 && command -v wire
         wgcf register --accept-tos || echo "registration reported an error"
       fi
       if [ -s wgcf-account.toml ] && wgcf generate && [ -s wgcf-profile.conf ]; then
-        printf 'WGConfig = /tmp/warp/wgcf-profile.conf\n\n[Socks5]\nBindAddress = 127.0.0.1:40000\n' > wireproxy.conf
+        printf 'WGConfig = %s/wgcf-profile.conf\n\n[Socks5]\nBindAddress = 127.0.0.1:40000\n' "$WDIR" > wireproxy.conf
         echo "starting wireproxy"
         wireproxy -c wireproxy.conf > /dev/null 2>&1 &
         wp=$!
         fails=0
         worked=0
-        sleep 30
+        # first test after a few seconds (the tunnel is usually up at once), then the regular watchdog
+        for i in 1 2 3 4 5 6; do
+          sleep 5
+          curl -s -m 8 --socks5-hostname 127.0.0.1:40000 https://www.cloudflare.com/cdn-cgi/trace 2>/dev/null | grep -Eq 'warp=(on|plus)' && break
+        done
         # watchdog: test the tunnel while wireproxy runs
         while kill -0 "$wp" 2>/dev/null; do
           if curl -s -m 15 --socks5-hostname 127.0.0.1:40000 https://www.cloudflare.com/cdn-cgi/trace 2>/dev/null | grep -Eq 'warp=(on|plus)'; then

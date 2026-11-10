@@ -42,12 +42,14 @@ function client(route, browser) {
 }
 
 // ---------- WARP status ----------
-let warpUp = false, warpCheckedAt = 0;
+let warpUp = false, warpCheckedAt = 0, warpFirstUp = 0;
+const processStart = Date.now();
 async function checkWarp() {
     warpCheckedAt = Date.now();
     try {
         const r = await new Impit({ proxyUrl: WARP_PROXY, timeout: 8000 }).fetch('https://www.cloudflare.com/cdn-cgi/trace');
         warpUp = /warp=(on|plus)/.test(await r.text());
+        if (warpUp && !warpFirstUp) warpFirstUp = Date.now();
     } catch (e) {
         warpUp = false;
     }
@@ -55,7 +57,9 @@ async function checkWarp() {
 }
 function startWarpWatch() {
     if (process.env.WARP === '0') return;
-    const loop = async () => { await checkWarp(); setTimeout(loop, warpUp ? 10 * 60000 : 30000).unref(); };
+    const started = Date.now();
+    // while WARP is still coming up after a start, look every 5 seconds (it is usually there within half a minute)
+    const loop = async () => { await checkWarp(); setTimeout(loop, warpUp ? 10 * 60000 : Date.now() - started < 10 * 60000 ? 5000 : 30000).unref(); };
     loop();
 }
 
@@ -336,4 +340,4 @@ const ipOf = route => (route === 'node' || route === 'direct') ? 'server' : rout
 function warpLog() { try { return require('fs').readFileSync('/tmp/warp.log', 'utf8').split('\n').filter(Boolean).slice(-25); } catch (e) { return ['no warp log']; } }
 
 let stoReady = false;
-module.exports = { stoInit: () => { const sto = require('./sto-session.js'); if (!stoReady && sto.status().loggedIn) { stoReady = true; require('./sto-access.js').init({ nativeFetch, smartFetch, trace, plainHeaders, session: sto }); } return stoReady; }, stoGated: () => stoReady && require('./sto-access.js').state() !== 'ok', stoStatus: () => require('./sto-access.js').status(), hasCookie: url => !!cookieHeader(url), rememberedRoute: host => { const m = memory.get(host); return m && m.until > Date.now() ? m.route : null; }, open, availableRoutes, peek, probe: (route, url, opts) => once(route, url, opts || {}, true), warpOn: () => warpUp, traceStore, smartFetch, nativeFetch, startWarpWatch, checkWarp, diag, ipOf, deadLinks: () => deadLinks.size, status: () => ({ deadLinks: [...deadLinks.values()].filter(t => t > Date.now()).length, down: Object.fromEntries([...down].filter(([, t]) => t > Date.now()).map(([h, t]) => [h, new Date(t).toISOString()])), warp: warpUp, warpLog: warpLog(), proxy: !!PROXY_URL, remembered: Object.fromEntries([...memory].map(([h, m]) => [h, m.route])), stats }) };
+module.exports = { stoInit: () => { const sto = require('./sto-session.js'); if (!stoReady && sto.status().loggedIn) { stoReady = true; require('./sto-access.js').init({ nativeFetch, smartFetch, trace, plainHeaders, session: sto }); } return stoReady; }, stoGated: () => stoReady && require('./sto-access.js').state() !== 'ok', stoStatus: () => require('./sto-access.js').status(), hasCookie: url => !!cookieHeader(url), rememberedRoute: host => { const m = memory.get(host); return m && m.until > Date.now() ? m.route : null; }, open, availableRoutes, peek, probe: (route, url, opts) => once(route, url, opts || {}, true), warpOn: () => warpUp, warpStartSeconds: () => warpFirstUp ? Math.round((warpFirstUp - processStart) / 1000) : null, traceStore, smartFetch, nativeFetch, startWarpWatch, checkWarp, diag, ipOf, deadLinks: () => deadLinks.size, status: () => ({ deadLinks: [...deadLinks.values()].filter(t => t > Date.now()).length, down: Object.fromEntries([...down].filter(([, t]) => t > Date.now()).map(([h, t]) => [h, new Date(t).toISOString()])), warp: warpUp, warpLog: warpLog(), proxy: !!PROXY_URL, remembered: Object.fromEntries([...memory].map(([h, m]) => [h, m.route])), stats }) };

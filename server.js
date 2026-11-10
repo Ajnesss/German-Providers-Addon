@@ -4,6 +4,9 @@
 // and tags every stream with a binge group so "next episode" stays on the German source.
 'use strict';
 
+// a restore from the backup waits here until the next start, before anything reads the addon's memory (backup.js)
+try { require('./backup.js').applyPendingRestore(m => console.log(`${new Date().toISOString()} ${m}`)); } catch (e) { console.log(`restore failed: ${e.message}`); }
+
 const http = require('http');
 const net = require('./net.js');
 const passthrough = require('./stream.js');
@@ -16,6 +19,7 @@ const fs = require('fs');
 const path = require('path');
 
 // ---------- settings (environment variables) ----------
+const VERSION = '1.25.0';
 const PORT = Number(process.env.PORT) || 7000;
 let TMDB_API_KEY = (process.env.TMDB_API_KEY || '').trim();
 // a copy on another server (e.g. Oracle) can get the key from the main one (Render) with the relay password
@@ -900,7 +904,7 @@ async function runAudit(audit) {
 function addonManifest() {
     return {
         id: 'community.german-providers.addon',
-        version: '1.24.1',
+        version: VERSION,
         name: 'German Providers',
         description: `Deutsche Quellen (s.to, AniWorld, ARD, Arte, FilmPalast …) als Addon. Plugins v${pluginVersion} von InvalidPandaa/nuvio-german-providers (GPL-3.0).`,
         logo: publicBase ? `${publicBase}/logo.png` : 'https://flagcdn.com/w160/de.png',
@@ -1003,7 +1007,7 @@ const server = http.createServer(async (req, res) => {
         if (!providers.length) problems.push('no providers loaded');
         if (process.env.WARP !== '0' && warpDownSince && Date.now() - warpDownSince > 30 * 60000) problems.push('WARP down for over 30 minutes');
         const paused = providers.filter(p => p.pausedUntil > Date.now()).map(p => p.id);
-        return send(res, problems.length ? 503 : 200, { ok: !problems.length, problems, warp: net.warpOn(), addon: `${req.headers['x-forwarded-proto'] || 'http'}://${req.headers.host}/manifest.json`, plugins: pluginVersion, providers: providers.map(p => p.id), paused, tmdbKey: !!TMDB_API_KEY, tmdbKeyStatus: keyStatus, linkChecks: verifyStats, serienstreamLogin: require('./sto-session.js').status().loggedIn, serienstreamCheck: (() => { if (!net.stoInit()) return null; const x = net.stoStatus(); return { links: x.links, meaning: x.meaning, since: x.since, login: x.login, availabilityPercent: x.availabilityPercent, details: '/sto/status' }; })(), notify: (() => { const n = require('./notify.js').state; return { lastRun: n.lastRun, serienstream: n.sto, sent: n.sent.slice(0, 3) }; })(), downHosts: net.status().down });
+        return send(res, problems.length ? 503 : 200, { ok: !problems.length, problems, version: VERSION, upSince: new Date(Date.now() - process.uptime() * 1000).toISOString(), warp: net.warpOn(), warpUpAfterSeconds: net.warpStartSeconds(), addon: `${req.headers['x-forwarded-proto'] || 'http'}://${req.headers.host}/manifest.json`, plugins: pluginVersion, providers: providers.map(p => p.id), paused, tmdbKey: !!TMDB_API_KEY, tmdbKeyStatus: keyStatus, linkChecks: verifyStats, serienstreamLogin: require('./sto-session.js').status().loggedIn, serienstreamCheck: (() => { if (!net.stoInit()) return null; const x = net.stoStatus(); return { links: x.links, meaning: x.meaning, since: x.since, login: x.login, availabilityPercent: x.availabilityPercent, details: '/sto/status' }; })(), notify: (() => { const n = require('./notify.js').state; return { lastRun: n.lastRun, serienstream: n.sto, sent: n.sent.slice(0, 3) }; })(), downHosts: net.status().down });
     }
     if (url === '/logo.png') {
         try {
@@ -1068,6 +1072,57 @@ const server = http.createServer(async (req, res) => {
 <p>Logged in: <b>${test.loggedIn ? 'yes' : 'no'}</b> · Check required: <b>${test.gate || '?'}</b> · German hoster link: <b>${test.hosterLink || 'none'}</b>${test.error ? ' · Error: ' + test.error : ''}</p>
 ${ok && enc ? `<p><b>Keep it after updates:</b> on GitHub choose <i>Add file → Create new file</i>, name it <code>sto-session.enc</code>, paste everything below and commit. It is encrypted so that only your Oracle server can read it.</p><textarea rows="6" readonly onclick="this.select()">${enc}</textarea>` : ''}
 ${ok && !enc ? '<p>Saved until the next server update (this machine could not create an encrypted copy).</p>' : ''}`);
+    }
+    // backups of the addon's memory to your private GitHub repository (backup.js)
+    // how long a looked-up answer is kept (for checking the WARP rule after a restart): /debug/cache?key=movie:tt0133093
+    if (url === '/debug/cache') {
+        const k = new URL(req.url, 'http://x').searchParams.get('key') || '';
+        const e = cache.get(k);
+        return send(res, 200, e ? { key: k, ageSeconds: Math.round((Date.now() - e.time) / 1000), keptMinutes: Math.round(e.ttl / 60000) } : { key: k, cached: false });
+    }
+    if (url === '/backup/status') return send(res, 200, require('./backup.js').status());
+    if (url === '/backup/test') {
+        const b = require('./backup.js');
+        const last = b.status().lastRestoreTest;
+        if (last && Date.now() - Date.parse(last.at) < 5 * 60e3) return send(res, 200, Object.assign({ note: 'result of the test a few minutes ago' }, last));
+        let live = {};
+        try { const st = require('./sto-access.js').status(); live = { health: health.summary().tracked, stoLinks: st.remembered.playLinks, stoEpisodes: st.remembered.episodes, stoEvents: (st.recentEvents || []).length, plexLinked: require('./plex.js').status().linked }; } catch (e) {}
+        try { return send(res, 200, await b.restoreTest(live)); } catch (e) { return send(res, 200, { ok: false, error: e.message }); }
+    }
+    if (url === '/backup') {
+        const b = require('./backup.js');
+        const page = (title, body) => { res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-store' }); res.end(`<!doctype html><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>${title}</title>
+<style>body{font:16px system-ui,sans-serif;max-width:680px;margin:32px auto;padding:0 16px;background:#14171c;color:#e8e8e8}input,button{display:block;width:100%;box-sizing:border-box;margin:6px 0 14px;padding:11px;border-radius:6px;border:1px solid #444;background:#1f242c;color:#fff;font:inherit}button{background:#2d6cdf;border:0;cursor:pointer}code{word-break:break-all;background:#1f242c;padding:8px;display:block;border-radius:6px}small{color:#aaa}</style>${body}`); };
+        const esc = x => String(x == null ? '' : x).replace(/[<>&"]/g, c => ({ '<': '&lt;', '>': '&gt;', '&': '&amp;', '"': '&quot;' }[c]));
+        if (req.method !== 'POST') {
+            const st = b.status();
+            return page('Backups', `<h2>Backups of the addon's memory</h2><p>Set up: <b>${st.setUp ? 'yes, to ' + esc(st.repo) : 'no'}</b> · Last backup: <b>${st.lastBackup ? esc(st.lastBackup.at) : 'none yet'}</b></p>
+<form method="post"><h3>Set up / change</h3><label>Admin password</label><input name="token" type="password" required autocomplete="off">
+<label>Private GitHub repository (owner/name)</label><input name="repo" placeholder="Ajnesss/select-de-backups" value="${esc(st.repo || '')}">
+<label>Fine-grained GitHub token (only that repository, Contents: read and write)</label><input name="ghtoken" type="password" autocomplete="off" placeholder="${st.setUp ? 'leave empty to keep the saved one' : 'github_pat_...'}">
+<input type="hidden" name="do" value="setup"><button>Save and make a backup now</button></form>
+<form method="post"><h3>Restore</h3><label>Admin password</label><input name="token" type="password" required autocomplete="off">
+<label>Backup key (shown when backups were set up)</label><input name="key" autocomplete="off">
+${st.setUp ? '' : '<label>On a new server: GitHub repository (owner/name)</label><input name="repo"><label>and the GitHub token</label><input name="ghtoken" type="password" autocomplete="off">'}<input type="hidden" name="do" value="restore">
+<button>Restore the newest backup and restart the addon</button></form><small>The restore test (<a href="/backup/test" style="color:#8ab4f8">/backup/test</a>) checks the newest backup without changing anything.</small>`);
+        }
+        let body = '';
+        for await (const c of req) { body += c; if (body.length > 10000) break; }
+        const q = new URLSearchParams(body);
+        if (!adminOk(q)) return page('Backups', '<h2>Wrong admin password</h2>');
+        try {
+            if (q.get('do') === 'restore') {
+                const key = (q.get('key') || '').trim().toLowerCase();
+                if (!/^[0-9a-f]{64}$/.test(key)) return page('Backups', '<h2>That is not a backup key</h2><p>It is 64 characters, 0-9 and a-f.</p>');
+                const r = await b.prepareRestore(key, { token: q.get('ghtoken'), repo: q.get('repo') });
+                setTimeout(() => process.kill(process.pid, 'SIGTERM'), 1500);
+                return page('Restoring', `<h2>✅ Backup from ${esc(r.backupFrom)} checked (${r.files} files)</h2><p>The addon restarts now and starts with that memory. It answers again in about a minute.</p>`);
+            }
+            const newKey = b.setup({ token: q.get('ghtoken'), repo: q.get('repo') });
+            const r = await b.backupNow({ reason: 'setup', version: VERSION });
+            return page('Backups', `<h2>✅ Backup saved</h2><p>${r.files} files, ${Math.round(r.bytes / 1024)} KB, encrypted, in <b>${esc(b.status().repo)}</b>. From now on once a day.</p>
+${newKey ? `<h3>Your backup key: keep it somewhere safe (password manager or a note)</h3><code>${newKey}</code><p><small>Without this key a backup cannot be opened, by anyone, including after a server loss. It is shown only this once.</small></p>` : ''}`);
+        } catch (e) { return page('Backups', `<h2>Did not work</h2><p>${esc(e.message)}</p>`); }
     }
     // Plex: link your account (Plex's own sign-in page), status, and read-only catalogue look-ups (see plex.js)
     if (url.startsWith('/plex/')) {
@@ -1289,6 +1344,7 @@ if (require.main === module) {
         setTimeout(() => process.exit(0), 1500).unref();
     });
     net.startWarpWatch();
+    require('./backup.js').schedule(log);
     // YouTube film channels: fetch their lists after the start and then once a day
     if (!SKIP.includes('youtube')) { const w = () => require('./youtube.js').warm().catch(() => {}); setTimeout(w, 3 * 60000).unref(); setInterval(w, 24 * 3600 * 1000).unref(); }
     if (AUTO_UPDATE) { update(); setInterval(update, UPDATE_HOURS * 3600000).unref(); }
